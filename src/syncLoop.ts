@@ -69,19 +69,21 @@ export class SyncLoop {
     this.env.onServerUrlChange((url) => {
       this.remotes.clear();
       if (url) {
-        if (!this.timer && !this.stopped) this.start();
+        // No immediate tick: publishToServer still has to push the directory,
+        // and a sync before that is refused by the server (USER_REVOKED).
+        if (!this.timer && !this.stopped) this.start({ immediate: false });
       } else {
         this.pauseTimer();
       }
     });
   }
 
-  start(): void {
+  start(options: { immediate?: boolean } = {}): void {
     if (!this.env.serverUrl || this.timer || this.stopped) return;
     this.timer = setInterval(() => {
       void this.tick();
     }, this.intervalMs);
-    void this.tick();
+    if (options.immediate !== false) void this.tick();
   }
 
   private pauseTimer(): void {
