@@ -79,12 +79,40 @@ export class LiveRegistry {
   }
 
   /** View-change subscription: fire a lightweight event whenever the db changes. */
-  startViewWatch(subscriptionId: string, dbId: string): void {
+  startViewWatch(subscriptionId: string, dbId: string, refresh?: () => Promise<void>): void {
     const db = this.getDb(dbId);
-    const unsub = db.addChangeListener?.(() =>
-      this.emitter.sendEvent(subscriptionId, "view-changed", {}),
-    );
-    this.subs.set(subscriptionId, { cancel: () => unsub?.() });
+    let disposed = false;
+    // Coalesce bursts: one refresh in flight, at most one queued behind it.
+    let running: Promise<void> | null = null;
+    let again = false;
+    const onChange = (): void => {
+      if (disposed) return;
+      if (running) {
+        again = true;
+        return;
+      }
+      running = (async () => {
+        do {
+          again = false;
+          try {
+            await refresh?.();
+          } catch (err) {
+            log.warn("liveRegistry", "view refresh failed", err);
+          }
+          if (disposed) return;
+          this.emitter.sendEvent(subscriptionId, "view-changed", {});
+        } while (again && !disposed);
+      })().finally(() => {
+        running = null;
+      });
+    };
+    const unsub = db.addChangeListener?.(onChange);
+    this.subs.set(subscriptionId, {
+      cancel: () => {
+        disposed = true;
+        unsub?.();
+      },
+    });
   }
 
   /** Changefeed: stream every changed document from `cursor`, then follow live. */
@@ -103,6 +131,7 @@ export class LiveRegistry {
 
     const loop = async (): Promise<void> => {
       let current = cursor;
+      let reportedCaughtUp = false;
       while (!disposed) {
         try {
           let advanced = false;
@@ -115,7 +144,9 @@ export class LiveRegistry {
               cursor: toPlainJson(next),
             });
           }
-          if (!advanced) {
+          // Once after the replay, then whenever a pass found nothing new.
+          if (!reportedCaughtUp || !advanced) {
+            reportedCaughtUp = true;
             this.emitter.sendEvent(subscriptionId, "caught-up", { cursor: toPlainJson(current) });
           }
         } catch (err) {

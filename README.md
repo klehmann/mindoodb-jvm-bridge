@@ -100,17 +100,45 @@ stdout so a launcher (e.g. `Sidecar.start` in the Kotlin client) can discover
 
 **Session (per-user child):**
 
-- Documents: get/list/create/update/delete/history
-- Query, live query, virtual-view navigators, full-text setup
+- Documents: get/list/create/update/delete (single and batch)/undelete/history;
+  updates are JSON patches applied against `baseHeads`, with MindooDB typed
+  values (atomic strings, counters, timestamps)
+- Query, live query, full-text setup
+- Virtual-view navigators that stay current while subscribed
 - Attachments: streamed read/write with flow control
 - Changefeed + live events
 - KeyBag: `createDocKey` / `listKeys` / persist
 - `session.openDatabase` — `local` (on-disk) or `remote` (primary
   `ClientNetworkContentAddressedStore`; intentionally slow)
-- `session.setServerUrl` / `session.refresh` / `session.publishToServer`
+- `session.setServerUrl` / `session.refresh` / `session.publishToServer`; sync
+  covers `directory`, `userdirectory` and every open local database, docs and
+  attachments
 - `tenant.approveJoinRequest`
 
 See [PROTOCOL.md](./PROTOCOL.md) for parameter shapes and error codes.
+
+## Tests
+
+`scripts/e2e/server-sync.mjs` drives the built sidecar frame by frame, like the
+Kotlin client, against a real MindooDB server: tenant, CRUD, typed values,
+attachments, query, full-text, views, changefeed, publish, join and two-user sync.
+It needs a server that lets any signed user register tenants:
+
+```bash
+# one-time server setup (from the workspace root)
+MINDOODB_SERVER_PASSWORD=test node mindoodb/dist/node/server/serverinit.js \
+  --name cn=testserver/o=test --skip-admin -d /tmp/mdb-server
+cat > /tmp/mdb-server/config.json <<'JSON'
+{ "capabilities": { "POST:/system/tenants/*": [{ "username": "*", "publicsignkey": "*" }] } }
+JSON
+MINDOODB_SERVER_PASSWORD=test node mindoodb/dist/node/server/server.js -d /tmp/mdb-server -p 1761
+
+# in mindoodb-jvm-bridge
+pnpm build && pnpm e2e -- "$(mktemp -d)" http://127.0.0.1:1761
+```
+
+The Kotlin client's `ServerSyncIntegrationTest` runs the same flow against
+`MINDOODB_TEST_SERVER_URL`.
 
 ## Kotlin client
 

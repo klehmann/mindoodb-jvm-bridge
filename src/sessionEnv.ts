@@ -17,6 +17,7 @@ import {
 import { base64ToBytes, bytesToBase64 } from "./bytes";
 import { BridgeError, ErrorCodes } from "./protocol";
 import { log } from "./logging";
+import { pullSystemDatabases } from "./syncLoop";
 
 export type DatabaseMode = "local" | "remote";
 
@@ -88,6 +89,17 @@ export class SessionEnv {
     return this.databaseIds().filter((id) => this.dbModes.get(id) === "local");
   }
 
+  /**
+   * A session database, or a tenant database the caller did not open (the
+   * system databases `directory` and `userdirectory`), opened locally.
+   */
+  async openTenantDb(dbId: string): Promise<MindooDB> {
+    return (
+      this.dbs.get(dbId) ??
+      (await this.tenant.openDB(dbId, dbId === "directory" ? { adminOnlyDb: true } : undefined))
+    );
+  }
+
   async openDatabase(dbId: string, mode: DatabaseMode = "local"): Promise<OpenDatabaseResult> {
     if (!dbId) throw new BridgeError(ErrorCodes.BadRequest, "Missing dbId");
     if (mode !== "local" && mode !== "remote") {
@@ -107,7 +119,7 @@ export class SessionEnv {
     }
 
     if (mode === "local") {
-      const db = await this.tenant.openDB(dbId);
+      const db = await this.openTenantDb(dbId);
       this.dbs.set(dbId, db);
       this.dbModes.set(dbId, "local");
       log.info("sessionEnv", `opened database "${dbId}" (local)`);
@@ -208,7 +220,16 @@ export async function openSessionEnv(params: {
   );
 
   for (const id of params.databases) {
-    await env.openDatabase(id, "local");
+    try {
+      await env.openDatabase(id, "local");
+    } catch (err) {
+      // A grant that is still only on the server (fresh join, new device):
+      // fetch the directory once and retry.
+      if (!env.serverUrl) throw err;
+      log.info("sessionEnv", `opening "${id}" failed, pulling directory from ${env.serverUrl}`);
+      await pullSystemDatabases(tenant, env.serverUrl);
+      await env.openDatabase(id, "local");
+    }
   }
 
   return env;

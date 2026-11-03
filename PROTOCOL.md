@@ -48,16 +48,20 @@ threadpool-backed, so it does not block the event loop — and never fork a chil
   The caller can then `session.open` with `userId` + `password`. `adminIdentity`
   is the admin `PrivateUserId` (password-locked) for join approval.
 - `identity.createUser` — params `{ username, password }`. Creates a standalone
-  password-locked identity. Returns
+  password-locked identity with its person-bound User-Key (MindooDB needs it to
+  approve a join request). Returns
   `{ username, signingPublicKey, encryptionPublicKey, identity }`, where
   `identity` is the full `PrivateUserId` (private keys are already
   password-encrypted).
 - `identity.createJoinRequest` — params `{ identity, label?, format? }`
-  (`format` defaults to `"uri"`). Returns `{ format, joinRequest }`.
+  (`format` defaults to `"uri"`, `label` names the device for the approving
+  admin and defaults to `JVM bridge (<hostname>)`). Returns `{ format, joinRequest }`.
 - `identity.joinTenant` — params
   `{ joinResponse, user, password, sharePassword?, databases?, serverUrl? }`.
   Imports doc keys (v3: RSA-wrapped to the requesting device; v2: `sharePassword`),
-  writes an identity bundle, returns
+  pulls `directory` + `userdirectory` from the server (response `serverUrl` or
+  the parameter) so the grant is local, opens `databases`, writes an identity
+  bundle, returns
   `{ tenantId, userId, databases, envDir, identityFile, serverUrl }`.
 
 ## 2. JSON envelope
@@ -82,6 +86,11 @@ every frame afterwards and validated against the connection's session.
 
 `NotAuthorized`, `SessionClosed`, `NotFound`, `Conflict`, `IndexNotReady`,
 `BadRequest`, `FulltextNotEnabled`, `Internal`.
+
+MindooDB errors map as: document not found / deleted → `NotFound`; access
+denied / missing key → `NotAuthorized`; query errors → `BadRequest`
+(`FulltextNotEnabled` for a text search without index); anything else →
+`Internal`.
 
 ## 3. Opening a session
 
@@ -110,15 +119,26 @@ Close with `session.close` (or just drop the connection); the child is reaped.
   `ClientNetworkContentAddressedStore` (every CAS op is remoted; requires
   `serverUrl`). Remote-primary DBs are skipped by the sync loop.
 - `session.setServerUrl` `{ serverUrl }` — persist sync peer URL (or `null` to
-  clear) and start/stop the background sync loop.
+  clear) and start/stop the background sync loop (every 5 s).
+- `session.refresh` `{ db?, direction?: "both"|"pull"|"push" }` — sync now: one
+  database, or `directory`, `userdirectory` and every open local database; docs
+  and attachments stores. Returns `{ pulled, reconciled, pushed, databases:
+  [{ dbId, pulledEntries, pushedEntries, pushedBytes, rejectedEntries }] }`.
+  `BadRequest` without a server URL; sync errors are returned, not swallowed.
 - `session.publishToServer`
-  `{ serverUrl, systemAdminUser, systemAdminPassword, adminPassword?, adminUsername? }`
-  — register the tenant on a MindooDB sync server (needs *server* system-admin
-  credentials), best-effort directory bootstrap push, then `setServerUrl`.
+  `{ serverUrl, systemAdminUser?, systemAdminPassword?, adminPassword?, adminUsername?, adminIdentity?, registerUsers? }`
+  — register the tenant on a MindooDB sync server, `setServerUrl`, then push
+  `directory` and `userdirectory` as the tenant admin (`adminIdentity` or the
+  bundle's admin + `adminPassword`). Without system-admin credentials the tenant
+  admin signs the registration, which servers accept when any signed user may
+  create tenants. Returns `{ ok, serverUrl, pushed: [...] }`.
 - `tenant.approveJoinRequest`
-  `{ joinRequest, adminPassword, sharePassword?, adminIdentity?, adminSigningKey?, format?, ... }`
-  — admin approves a join; default `format` is `"uri"`. New responses wrap doc keys
-  to the requester's encryption public key (`sharePassword` is ignored).
+  `{ joinRequest, adminPassword, adminIdentity?, adminSigningKey?, label?, username?, tenantLabel?, sharedDocKeyIds?, serverUrl?, format? }`
+  — admin approves a join; default `format` is `"uri"`. Responses wrap doc keys
+  to the requester's encryption public key (`sharePassword` is ignored). `label`
+  overrides the device label, `username` registers the device under an existing
+  person. With a server URL the grant is pushed (`directory` + `userdirectory`)
+  right away. Returns `{ format, joinResponse, pushed }`.
 - `keybag.createDocKey` `{ keyId }`, `keybag.listKeys`, `keybag.persist` —
   create/list/re-save KeyBag doc keys (create auto-persists the identity bundle).
 
@@ -129,15 +149,28 @@ Session: `session.refresh`, `session.awaitIndexReady`, `session.listDatabases`,
 
 Documents: `documents.get`, `documents.list`, `documents.getHeadCursor`,
 `documents.create`, `documents.createMany`, `documents.update`,
-`documents.delete`, `documents.undelete`, `documents.listHistory`,
+`documents.delete`, `documents.deleteMany` (`{ db, docIds }`),
+`documents.listDeleted`, `documents.undelete`, `documents.listHistory`,
 `documents.getAtRevision`.
 
-`documents.update` params: `{ db, docId, baseHeads?, operations: UpdateOp[] }`
+`documents.create` `options` are MindooDB `CreateOptions` (`id`, `idPrefix`,
+`assumeUniqueId`, `decryptionKeyId`, `initialValues`, ...). With a custom `id`,
+`initialValues` are written in a second change (MindooDB keeps the first change
+of a convergent ID fixed).
+
+`documents.update` params: `{ db, docId, baseHeads?, operations: UpdateOp[], options? }`
 where `UpdateOp` is `{op:"set",path,value}`, `{op:"unset",path}`,
-`{op:"merge",value}`, or `{op:"setText",path,value}`. Returns
-`{ heads, conflictExpected? }`. Pass the document's prior `heads` as `baseHeads`
-for optimistic concurrency; MindooDB always CRDT-merges, and
-`conflictExpected` flags that concurrent changes were merged in.
+`{op:"merge",value}`, `{op:"setText",path,value}`,
+`{op:"textSplice",path,index,deleteCount,insert?}`, `{op:"increment",path,delta}`,
+`{op:"listInsert",path,index,values}` or `{op:"listDelete",path,index,deleteCount}`.
+All operations become one JSON patch (`applyDocumentUpdate`), applied by group
+(set, unset, list, text, counter), not in list order. Values may be MindooDB
+typed values: `{"$mindoo":"atomic","value":"open"}` (a string concurrent
+changes cannot mix), `{"$mindoo":"counter","value":0}`,
+`{"$mindoo":"timestamp","value":<ms>}`; a plain string is collaborative text.
+With `baseHeads` the patch is made against that version and merged into the
+current one; `conflictExpected` flags that the document had moved on. Returns
+`{ heads, conflictExpected? }`.
 
 Query / views: `db.query`, `db.liveQuery.start` / `db.liveQuery.stop`,
 `view.openNavigator` / `view.createNavigator`, `nav.call`, `nav.subscribe` /
@@ -145,7 +178,16 @@ Query / views: `db.query`, `db.liveQuery.start` / `db.liveQuery.stop`,
 `{ navigatorId, method, args }` where `method` ∈ `getCurrentEntry`,
 `gotoFirst|gotoLast|gotoNext|gotoPrev|gotoParent|gotoFirstChild`,
 `expandAll|collapseAll|expandToLevel|expand|collapse`,
-`readForward|readBackward` (paging: `args = [limit, offset]`).
+`gotoNextSibling|gotoPrevSibling|gotoLastChild|gotoPos`,
+`expandPos|collapsePos`, `select|deselect|selectAll|deselectAll|isSelected`,
+`readForward|readBackward|readSelected` (paging: `args = [limit, offset]`),
+`refresh` (apply document changes to the view).
+
+`view.openNavigator` params: `{ db, definition, options?, navigatorOptions? }`
+with `navigatorOptions` `{ expandAll?, expandLevel?, hideEmptyCategories?,
+categoriesOnly?, documentsOnly?, fromCategory? }`. While `nav.subscribe` is
+active the view follows the database and `view-changed` fires after each
+update; without it, call `refresh`. `nav.dispose` releases the view.
 
 Full-text: `fulltext.getSetup`, `fulltext.setSetup`. Full-text search is a
 `text` clause on `db.query` (adds `textScore` per row).
@@ -196,7 +238,8 @@ starting the subscription:
 
 - live query: `query-result` (payload = `MindooQueryResult`), `query-error`.
 - navigator watch: `view-changed`.
-- changefeed: `change` (`{ doc, cursor }`), `caught-up`, `change-error`.
+- changefeed: `change` (`{ doc, cursor }`), `caught-up` (after the replay and
+  whenever a pass finds nothing new), `change-error`.
 - session lifecycle: `session-crashed` (child exited unexpectedly; re-open).
 
 ## 7. Security summary

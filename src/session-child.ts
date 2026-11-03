@@ -17,6 +17,7 @@ import {
   BridgeError,
   ErrorCodes,
   PROTOCOL,
+  type ErrorCode,
   type RpcRequest,
   type ServerFrame,
 } from "./protocol";
@@ -116,8 +117,25 @@ async function handleRequest(req: RpcRequest): Promise<void> {
     if (err instanceof BridgeError) {
       toSupervisor({ t: "out-text", msg: makeError(req.id, err.code, err.message) });
     } else {
-      toSupervisor({ t: "out-text", msg: makeError(req.id, ErrorCodes.Internal, String((err as Error)?.message ?? err)) });
+      toSupervisor({ t: "out-text", msg: makeError(req.id, errorCodeFor(err), String((err as Error)?.message ?? err)) });
     }
+  }
+}
+
+/** Map MindooDB's error classes to the bridge's stable error codes. */
+function errorCodeFor(err: unknown): ErrorCode {
+  const e = err as { name?: string; code?: string } | null;
+  switch (e?.name) {
+    case "DocumentNotFoundError":
+    case "DocumentDeletedError":
+      return ErrorCodes.NotFound;
+    case "AccessDeniedError":
+    case "SymmetricKeyNotFoundError":
+      return ErrorCodes.NotAuthorized;
+    case "MindooQueryError":
+      return e.code === "fulltext-not-enabled" ? ErrorCodes.FulltextNotEnabled : ErrorCodes.BadRequest;
+    default:
+      return ErrorCodes.Internal;
   }
 }
 

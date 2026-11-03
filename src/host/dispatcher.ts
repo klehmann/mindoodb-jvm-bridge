@@ -1,18 +1,36 @@
-import { VirtualViewFactory, type EncryptedPrivateKey, type PrivateUserId } from "mindoodb";
+import {
+  USER_DIRECTORY_DB_ID,
+  VirtualViewFactory,
+  type EncryptedPrivateKey,
+  type MindooDocumentUpdate,
+  type MindooJsonPatch,
+  type PrivateUserId,
+} from "mindoodb";
 import { BridgeError, ErrorCodes, Methods } from "../protocol";
 import type { DatabaseMode, SessionEnv } from "../sessionEnv";
-import type { SyncLoop } from "../syncLoop";
+import type { DatabaseSyncResult, SyncDirection, SyncLoop } from "../syncLoop";
 import type { Emitter } from "./emitter";
 import { NavigatorRegistry, type CoreNavigator } from "./navigatorRegistry";
 import { StreamRegistry } from "./streamRegistry";
 import { LiveRegistry } from "./liveRegistry";
 import { projectDocument, toPlainJson } from "./projections";
 
+type Path = Array<string | number>;
+
+/**
+ * One `documents.update` operation. Values may carry MindooDB typed values
+ * (`{ "$mindoo": "atomic" | "counter" | "timestamp", value }`); a plain string
+ * is collaborative text, as everywhere in MindooDB.
+ */
 type UpdateOp =
-  | { op: "set"; path: string[]; value: unknown }
-  | { op: "unset"; path: string[] }
+  | { op: "set"; path: Path; value: unknown }
+  | { op: "unset"; path: Path }
   | { op: "merge"; value: Record<string, unknown> }
-  | { op: "setText"; path: string[]; value: string };
+  | { op: "setText"; path: Path; value: string }
+  | { op: "textSplice"; path: Path; index: number; deleteCount: number; insert?: string }
+  | { op: "increment"; path: Path; delta: number }
+  | { op: "listInsert"; path: Path; index: number; values: unknown[] }
+  | { op: "listDelete"; path: Path; index: number; deleteCount: number };
 
 interface Params {
   [key: string]: unknown;
@@ -63,7 +81,8 @@ export class Dispatcher {
     const p = (rawParams ?? {}) as Params;
     switch (method) {
       case Methods.sessionRefresh:
-        return this.syncLoop.refresh(p.db as string | undefined);
+        this.requireServerUrl("session.refresh");
+        return this.syncLoop.refresh(p.db as string | undefined, (p.direction as SyncDirection | undefined) ?? "both");
       case Methods.sessionAwaitIndexReady:
         return this.awaitIndexReady(p.db as string | undefined);
       case Methods.sessionListDatabases:
@@ -94,11 +113,16 @@ export class Dispatcher {
       case Methods.docHeadCursor:
         return { cursor: toPlainJson(this.db(p.db as string).getLatestChangeCursor?.() ?? null) };
       case Methods.docCreate:
-        return projectDocument(await this.db(p.db as string).createDocument(p.options as never));
+        return this.createDocument(p);
       case Methods.docCreateMany: {
         const docs = await this.db(p.db as string).createDocuments((p.inputs as never[]) ?? []);
         return { documents: docs.map(projectDocument) };
       }
+      case Methods.docDeleteMany:
+        await this.db(p.db as string).deleteDocuments((p.docIds as string[]) ?? [], p.options as never);
+        return { ok: true };
+      case Methods.docListDeleted:
+        return { ids: await this.db(p.db as string).getDeletedDocumentIds(p.options as never) };
       case Methods.docUpdate:
         return this.updateDocument(p);
       case Methods.docDelete:
@@ -139,12 +163,20 @@ export class Dispatcher {
       case Methods.navCall:
         return { result: await this.navReg.call(p.navigatorId as string, p.method as string, (p.args as unknown[]) ?? []) };
       case Methods.navSubscribe: {
-        const entry = this.navReg.get(p.navigatorId as string);
-        this.liveReg.startViewWatch(p.subscriptionId as string, entry.dbId);
-        this.navReg.setUnsubscribe(p.navigatorId as string, () => this.liveReg.stop(p.subscriptionId as string));
+        const navigatorId = p.navigatorId as string;
+        const subscriptionId = p.subscriptionId as string;
+        const entry = this.navReg.get(navigatorId);
+        // Keep the view itself current, then tell the client to re-read.
+        const unbind = entry.view?.bindTo?.();
+        this.liveReg.startViewWatch(subscriptionId, entry.dbId, () => this.navReg.refresh(navigatorId));
+        this.navReg.setUnsubscribe(navigatorId, () => {
+          this.liveReg.stop(subscriptionId);
+          unbind?.();
+        });
         return { ok: true };
       }
       case Methods.navUnsubscribe:
+        if (p.navigatorId) this.navReg.clearUnsubscribe(p.navigatorId as string);
         this.liveReg.stop(p.subscriptionId as string);
         return { ok: true };
       case Methods.navDispose:
@@ -220,24 +252,51 @@ export class Dispatcher {
     return { ready: true };
   }
 
+  private requireServerUrl(method: string): string {
+    const url = this.env.serverUrl;
+    if (!url) {
+      throw new BridgeError(ErrorCodes.BadRequest, `${method} needs a serverUrl (session.setServerUrl or session.publishToServer)`);
+    }
+    return url;
+  }
+
+  /**
+   * MindooDB refuses `initialValues` together with a custom `id` (the
+   * deterministic seed change of a convergent id cannot carry them), so those
+   * are written in a follow-up change.
+   */
+  private async createDocument(p: Params): Promise<unknown> {
+    const db = this.db(p.db as string);
+    const options = { ...((p.options as Record<string, unknown> | undefined) ?? {}) };
+    const initialValues = options.initialValues as Record<string, unknown> | undefined;
+    if (options.id && !options.assumeUniqueId && initialValues && Object.keys(initialValues).length > 0) {
+      delete options.initialValues;
+      const doc = await db.createDocument(options as never);
+      const result = await db.applyDocumentUpdate(doc, { set: initialValues });
+      return projectDocument(result.doc);
+    }
+    return projectDocument(await db.createDocument(options as never));
+  }
+
+  /**
+   * Applies the operations as one change. With `baseHeads` the change is made
+   * against that version and merged into the current one, so concurrent edits
+   * of other fields survive and edits of the same field merge like any CRDT
+   * change; `conflictExpected` tells the caller that the document had moved on.
+   */
   private async updateDocument(p: Params): Promise<{ heads: string[]; conflictExpected?: boolean }> {
     const db = this.db(p.db as string);
     const doc = await db.getDocument(p.docId as string);
+    const headsBefore = doc.getHeads();
     const baseHeads = p.baseHeads as string[] | undefined;
-    if (baseHeads && !headsEqual(baseHeads, doc.getHeads())) {
-      // Optimistic concurrency: the caller edited a stale version. MindooDB/
-      // Automerge still merges, but we surface the divergence so the client can
-      // decide whether to re-read.
-      // (We proceed with the merge rather than rejecting - CRDT semantics.)
-    }
     const ops = (p.operations as UpdateOp[]) ?? [];
-    await db.changeDoc(doc, (mutable) => {
-      const data = mutable.getData() as Record<string, unknown>;
-      for (const op of ops) applyOp(data, op);
-    });
+    const json = toJsonPatch(ops);
+    if (baseHeads && baseHeads.length > 0) json.baseHeads = baseHeads;
+    const update: MindooDocumentUpdate = { json };
+    const result = await db.applyDocumentUpdate(doc, update, p.options as never);
     return {
-      heads: doc.getHeads(),
-      conflictExpected: baseHeads ? !headsEqual(baseHeads, doc.getHeads()) : undefined,
+      heads: result.heads,
+      conflictExpected: baseHeads ? !headsEqual(baseHeads, headsBefore) : undefined,
     };
   }
 
@@ -273,9 +332,9 @@ export class Dispatcher {
     if (typeof db.queryView !== "function") {
       throw new BridgeError(ErrorCodes.BadRequest, "Virtual views are not available on this database");
     }
-    const view = await db.queryView(p.definition, p.options);
+    const view = (await db.queryView(p.definition, p.options)) as EphemeralView;
     const nav = buildNavigator(view, p.navigatorOptions as NavigatorOptions | undefined);
-    const navigatorId = this.navReg.register(nav, dbId);
+    const navigatorId = this.navReg.register(nav, dbId, view);
     return { navigatorId };
   }
 
@@ -293,7 +352,9 @@ export class Dispatcher {
     return { keys, details: toPlainJson(details) as unknown[] };
   }
 
-  private async approveJoinRequest(p: Params): Promise<{ format: string; joinResponse: unknown }> {
+  private async approveJoinRequest(
+    p: Params,
+  ): Promise<{ format: string; joinResponse: unknown; pushed: DatabaseSyncResult[] }> {
     const joinRequest = p.joinRequest;
     if (joinRequest == null) {
       throw new BridgeError(ErrorCodes.BadRequest, "tenant.approveJoinRequest requires joinRequest");
@@ -308,10 +369,9 @@ export class Dispatcher {
 
     // Prefer an explicit adminSigningKey; otherwise use adminUser from the
     // identity bundle written at tenant.create.
+    const adminUser = (p.adminIdentity as PrivateUserId | undefined) ?? this.env.bundle.adminUser;
     let adminSigningKey = p.adminSigningKey as EncryptedPrivateKey | undefined;
     if (!adminSigningKey) {
-      const adminUser =
-        (p.adminIdentity as PrivateUserId | undefined) ?? this.env.bundle.adminUser;
       if (!adminUser) {
         throw new BridgeError(
           ErrorCodes.BadRequest,
@@ -325,65 +385,71 @@ export class Dispatcher {
     const joinResponse = await this.env.tenant.approveJoinRequest(joinRequest as never, {
       adminSigningKey,
       adminPassword,
-      sharePassword: p.sharePassword as string | undefined,
       serverUrl: (p.serverUrl as string | undefined) ?? this.env.serverUrl,
-      adminUsername: p.adminUsername as string | undefined,
+      adminUsername: (p.adminUsername as string | undefined) ?? adminUser?.username,
       sharedDocKeyIds: p.sharedDocKeyIds as string[] | undefined,
       label: p.label as string | undefined,
+      username: p.username as string | undefined,
+      tenantLabel: p.tenantLabel as string | undefined,
       format,
     } as never);
-    return { format, joinResponse };
+
+    // The grant lives in the admin-signed directory: the new member can only
+    // sync once it is on the server.
+    const pushed = this.env.serverUrl ? await this.pushSystemDatabases(adminUser, adminPassword) : [];
+    return { format, joinResponse, pushed };
   }
 
-  private async publishToServer(p: Params): Promise<{ ok: true; serverUrl: string }> {
-    const serverUrl = p.serverUrl as string | undefined;
+  /** Push `directory` and `userdirectory`, authenticated as the tenant admin when known. */
+  private async pushSystemDatabases(adminUser: PrivateUserId | undefined, adminPassword: string | undefined) {
+    const networkAuthOverride = adminUser && adminPassword ? { user: adminUser, password: adminPassword } : undefined;
+    const pushed: DatabaseSyncResult[] = [];
+    for (const dbId of ["directory", USER_DIRECTORY_DB_ID]) {
+      pushed.push(await this.syncLoop.pushNow(dbId, { networkAuthOverride }));
+    }
+    return pushed;
+  }
+
+  /**
+   * Register the tenant on a MindooDB server and push its directory, as Haven
+   * does. `systemAdminUser`/`systemAdminPassword` are needed unless the server
+   * lets anyone register tenants (capability `POST:/system/tenants/*`).
+   */
+  private async publishToServer(p: Params): Promise<{ ok: true; serverUrl: string; pushed: DatabaseSyncResult[] }> {
+    const serverUrl = (p.serverUrl as string | undefined)?.replace(/\/$/, "");
     if (!serverUrl) {
       throw new BridgeError(ErrorCodes.BadRequest, "session.publishToServer requires serverUrl");
     }
     const systemAdminUser = p.systemAdminUser as PrivateUserId | undefined;
     const systemAdminPassword = p.systemAdminPassword as string | undefined;
-    if (!systemAdminUser || !systemAdminPassword) {
+    if (Boolean(systemAdminUser) !== Boolean(systemAdminPassword)) {
       throw new BridgeError(
         ErrorCodes.BadRequest,
-        "session.publishToServer requires systemAdminUser and systemAdminPassword",
+        "session.publishToServer needs systemAdminUser and systemAdminPassword together",
       );
     }
+    const adminUser = (p.adminIdentity as PrivateUserId | undefined) ?? this.env.bundle.adminUser;
 
+    // A server that lets any signed principal register tenants accepts the
+    // tenant admin in place of a system admin.
+    const adminPassword = p.adminPassword as string | undefined;
+    const auth = systemAdminUser
+      ? { systemAdminUser, systemAdminPassword }
+      : adminUser && adminPassword
+        ? { systemAdminUser: adminUser, systemAdminPassword: adminPassword }
+        : {};
     await this.env.tenant.publishToServer(serverUrl, {
-      systemAdminUser,
-      systemAdminPassword,
-      adminUsername: (p.adminUsername as string | undefined) ?? this.env.bundle.adminUser?.username,
+      ...auth,
+      adminUsername: (p.adminUsername as string | undefined) ?? adminUser?.username,
       registerUsers: p.registerUsers as never,
     });
 
-    // Bootstrap-push the directory so grants land before regular users sync.
-    try {
-      const directory = await this.env.tenant.openDB("directory");
-      const remote = await this.env.tenant.connectToServer(serverUrl, "directory");
-      const adminUser = this.env.bundle.adminUser;
-      const pushOpts =
-        adminUser && p.adminPassword
-          ? {
-              networkAuthOverride: {
-                user: adminUser,
-                password: p.adminPassword as string,
-              },
-            }
-          : undefined;
-      const dbAny = directory as unknown as {
-        pushChangesTo?: (r: unknown, opts?: unknown) => Promise<unknown>;
-      };
-      if (typeof dbAny.pushChangesTo === "function") {
-        await dbAny.pushChangesTo(remote, pushOpts);
-      }
-    } catch (err) {
-      // Registration succeeded; directory bootstrap is best-effort.
-      // Callers can still sync later via session.refresh.
-    }
-
     await this.env.setServerUrl(serverUrl);
+    // Without the directory (grants) and userdirectory (User-Key wraps) on the
+    // server, nobody - not even this user - can sync the tenant.
+    const pushed = await this.pushSystemDatabases(adminUser, adminPassword);
     this.syncLoop.start();
-    return { ok: true, serverUrl: serverUrl.replace(/\/$/, "") };
+    return { ok: true, serverUrl, pushed };
   }
 }
 
@@ -391,28 +457,30 @@ interface NavigatorOptions {
   expandLevel?: number;
   expandAll?: boolean;
   hideEmptyCategories?: boolean;
+  categoriesOnly?: boolean;
+  documentsOnly?: boolean;
+  fromCategory?: string;
 }
 
-/** A VirtualView (or ephemeral wrapper exposing `.view`). */
-function resolveView(view: unknown): unknown {
-  const wrapper = view as { view?: unknown; getView?: () => unknown };
-  if (wrapper && typeof wrapper.getView === "function") return wrapper.getView();
-  if (wrapper && wrapper.view) return wrapper.view;
-  return view;
+/** The `EphemeralSummaryView` returned by `MindooDB.queryView`. */
+export interface EphemeralView {
+  getView(): unknown;
+  update(options?: unknown): Promise<void>;
+  bindTo?(): () => void;
+  dispose?(): void;
 }
 
-function buildNavigator(view: unknown, options?: NavigatorOptions): CoreNavigator {
-  const resolved = resolveView(view);
-  const builder = VirtualViewFactory.createNavigator(resolved as never) as unknown as {
-    hideEmptyCategories?: () => unknown;
-    expandAll?: () => unknown;
-    expandToLevel?: (n: number) => unknown;
-    build: () => CoreNavigator;
-  };
-  if (options?.hideEmptyCategories) builder.hideEmptyCategories?.();
-  if (options?.expandAll) builder.expandAll?.();
-  else if (typeof options?.expandLevel === "number") builder.expandToLevel?.(options.expandLevel);
-  return builder.build();
+function buildNavigator(view: EphemeralView, options?: NavigatorOptions): CoreNavigator {
+  const builder = VirtualViewFactory.createNavigator(view.getView() as never);
+  if (options?.hideEmptyCategories) builder.hideEmptyCategories();
+  if (options?.categoriesOnly) builder.categoriesOnly();
+  if (options?.documentsOnly) builder.documentsOnly();
+  if (options?.fromCategory) builder.fromCategory(options.fromCategory);
+  const nav = builder.build() as unknown as CoreNavigator;
+  // Expansion lives on the navigator (not the builder) since MindooDB 0.0.8x.
+  if (options?.expandAll) nav.expandAll();
+  else if (typeof options?.expandLevel === "number") nav.expandToLevel(options.expandLevel);
+  return nav;
 }
 
 function headsEqual(a: string[], b: string[]): boolean {
@@ -421,39 +489,42 @@ function headsEqual(a: string[], b: string[]): boolean {
   return b.every((h) => set.has(h));
 }
 
-function applyOp(data: Record<string, unknown>, op: UpdateOp): void {
-  switch (op.op) {
-    case "set":
-    case "setText":
-      setNested(data, op.path, op.value);
-      break;
-    case "unset":
-      unsetNested(data, op.path);
-      break;
-    case "merge":
-      for (const [key, value] of Object.entries(op.value)) data[key] = value as unknown;
-      break;
+function toJsonPatch(ops: UpdateOp[]): MindooJsonPatch {
+  const patch: Required<Omit<MindooJsonPatch, "baseHeads" | "textMark" | "textUnmark">> = {
+    set: [],
+    unset: [],
+    listInsert: [],
+    listDelete: [],
+    textSplice: [],
+    counterIncrement: [],
+  };
+  for (const op of ops) {
+    switch (op.op) {
+      case "set":
+      case "setText":
+        patch.set.push({ path: op.path, value: op.value });
+        break;
+      case "merge":
+        for (const [key, value] of Object.entries(op.value)) patch.set.push({ path: [key], value });
+        break;
+      case "unset":
+        patch.unset.push({ path: op.path });
+        break;
+      case "textSplice":
+        patch.textSplice.push({ path: op.path, index: op.index, deleteCount: op.deleteCount, insert: op.insert });
+        break;
+      case "increment":
+        patch.counterIncrement.push({ path: op.path, delta: op.delta });
+        break;
+      case "listInsert":
+        patch.listInsert.push({ path: op.path, index: op.index, values: op.values });
+        break;
+      case "listDelete":
+        patch.listDelete.push({ path: op.path, index: op.index, deleteCount: op.deleteCount });
+        break;
+      default:
+        throw new BridgeError(ErrorCodes.BadRequest, `Unknown update op: ${(op as { op?: unknown }).op}`);
+    }
   }
-}
-
-function setNested(root: Record<string, unknown>, path: string[], value: unknown): void {
-  if (path.length === 0) return;
-  let node = root;
-  for (let i = 0; i < path.length - 1; i++) {
-    const key = path[i];
-    if (typeof node[key] !== "object" || node[key] === null) node[key] = {};
-    node = node[key] as Record<string, unknown>;
-  }
-  node[path[path.length - 1]] = value;
-}
-
-function unsetNested(root: Record<string, unknown>, path: string[]): void {
-  if (path.length === 0) return;
-  let node = root;
-  for (let i = 0; i < path.length - 1; i++) {
-    const key = path[i];
-    if (typeof node[key] !== "object" || node[key] === null) return;
-    node = node[key] as Record<string, unknown>;
-  }
-  delete node[path[path.length - 1]];
+  return patch;
 }

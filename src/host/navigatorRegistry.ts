@@ -1,5 +1,7 @@
+import { SelectedOnly } from "mindoodb";
 import { BridgeError, ErrorCodes } from "../protocol";
 import { projectViewEntry, type ViewEntryDTO } from "./projections";
+import type { EphemeralView } from "./dispatcher";
 
 /** A core VirtualViewNavigator (structurally typed to avoid deep generics). */
 export interface CoreNavigator {
@@ -13,16 +15,29 @@ export interface CoreNavigator {
   expandAll(): unknown;
   collapseAll(): unknown;
   expandToLevel(level: number): unknown;
+  gotoNextSibling(): boolean;
+  gotoPrevSibling(): boolean;
+  gotoLastChild(): boolean;
+  gotoPos(posStr: string): boolean;
+  expandPos(posStr: string): unknown;
+  collapsePos(posStr: string): unknown;
+  select(origin: string, docId: string, selectParentCategories?: boolean): unknown;
+  deselect(origin: string, docId: string): unknown;
+  selectAllEntries(): unknown;
+  deselectAllEntries(): unknown;
+  isSelected(origin: string, docId: string): boolean;
   expand(origin: string, docId: string): unknown;
   collapse(origin: string, docId: string): unknown;
   isExpanded(entry: unknown): boolean;
-  entriesForward(): AsyncGenerator<unknown>;
-  entriesBackward(): AsyncGenerator<unknown>;
+  entriesForward(selectedOnly?: unknown): AsyncGenerator<unknown>;
+  entriesBackward(selectedOnly?: unknown): AsyncGenerator<unknown>;
 }
 
 interface NavigatorEntry {
   navigator: CoreNavigator;
   dbId: string;
+  /** The ephemeral view behind the navigator; refreshed on demand and disposed with it. */
+  view?: EphemeralView;
   /** Live-update unsubscribe (db change listener) if a subscription is active. */
   unsubscribe?: () => void;
 }
@@ -32,10 +47,15 @@ export class NavigatorRegistry {
   private nextId = 1;
   private readonly navigators = new Map<string, NavigatorEntry>();
 
-  register(navigator: CoreNavigator, dbId: string): string {
+  register(navigator: CoreNavigator, dbId: string, view?: EphemeralView): string {
     const id = `nav-${this.nextId++}`;
-    this.navigators.set(id, { navigator, dbId });
+    this.navigators.set(id, { navigator, dbId, view });
     return id;
+  }
+
+  /** Apply document changes since the last update to the view. */
+  async refresh(id: string): Promise<void> {
+    await this.require(id).view?.update();
   }
 
   private require(id: string): NavigatorEntry {
@@ -49,13 +69,22 @@ export class NavigatorRegistry {
   }
 
   setUnsubscribe(id: string, unsubscribe: () => void): void {
-    this.require(id).unsubscribe = unsubscribe;
+    const entry = this.require(id);
+    entry.unsubscribe?.();
+    entry.unsubscribe = unsubscribe;
+  }
+
+  clearUnsubscribe(id: string): void {
+    const entry = this.navigators.get(id);
+    entry?.unsubscribe?.();
+    if (entry) entry.unsubscribe = undefined;
   }
 
   dispose(id: string): void {
     const entry = this.navigators.get(id);
     if (!entry) return;
     entry.unsubscribe?.();
+    entry.view?.dispose?.();
     this.navigators.delete(id);
   }
 
@@ -102,6 +131,39 @@ export class NavigatorRegistry {
       case "collapse":
         nav.collapse(String(args[0]), String(args[1]));
         return { ok: true };
+      case "gotoNextSibling":
+        return nav.gotoNextSibling() ? this.projectCurrent(nav) : null;
+      case "gotoPrevSibling":
+        return nav.gotoPrevSibling() ? this.projectCurrent(nav) : null;
+      case "gotoLastChild":
+        return nav.gotoLastChild() ? this.projectCurrent(nav) : null;
+      case "gotoPos":
+        return nav.gotoPos(String(args[0])) ? this.projectCurrent(nav) : null;
+      case "expandPos":
+        nav.expandPos(String(args[0]));
+        return { ok: true };
+      case "collapsePos":
+        nav.collapsePos(String(args[0]));
+        return { ok: true };
+      case "select":
+        nav.select(String(args[0]), String(args[1]), Boolean(args[2]));
+        return { ok: true };
+      case "deselect":
+        nav.deselect(String(args[0]), String(args[1]));
+        return { ok: true };
+      case "selectAll":
+        nav.selectAllEntries();
+        return { ok: true };
+      case "deselectAll":
+        nav.deselectAllEntries();
+        return { ok: true };
+      case "isSelected":
+        return nav.isSelected(String(args[0]), String(args[1]));
+      case "refresh":
+        await this.refresh(id);
+        return { ok: true };
+      case "readSelected":
+        return this.read(nav, "entriesForward", Number(args[0] ?? 100), Number(args[1] ?? 0), "selected");
       case "readForward":
         return this.read(nav, "entriesForward", Number(args[0] ?? 100), Number(args[1] ?? 0));
       case "readBackward":
@@ -116,10 +178,11 @@ export class NavigatorRegistry {
     generator: "entriesForward" | "entriesBackward",
     limit: number,
     offset: number,
+    selectedOnly?: "selected",
   ): Promise<ViewEntryDTO[]> {
     const out: ViewEntryDTO[] = [];
     let index = 0;
-    for await (const entry of nav[generator]()) {
+    for await (const entry of nav[generator](selectedOnly ? SelectedOnly.YES : undefined)) {
       if (index++ < offset) continue;
       out.push(projectViewEntry(entry as never, nav.isExpanded(entry)));
       if (out.length >= limit) break;
