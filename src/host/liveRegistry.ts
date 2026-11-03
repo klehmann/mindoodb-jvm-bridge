@@ -1,5 +1,5 @@
 import type { Emitter } from "./emitter";
-import { projectDocument, toPlainJson } from "./projections";
+import { toChangeDto, toPlainJson } from "./projections";
 import { log } from "../logging";
 
 interface LiveDb {
@@ -11,6 +11,7 @@ interface LiveDb {
   ) => { unsubscribe(): void; refresh(): void };
   addChangeListener?: (listener: () => void) => () => void;
   iterateChangesSince: (cursor: unknown, options?: unknown) => AsyncGenerator<{ doc: unknown; cursor: unknown }>;
+  iterateChangeMetadataSince: (cursor: unknown, options?: unknown) => AsyncGenerator<{ cursor: unknown }>;
   getLatestChangeCursor?: () => unknown;
 }
 
@@ -116,7 +117,12 @@ export class LiveRegistry {
   }
 
   /** Changefeed: stream every changed document from `cursor`, then follow live. */
-  startChanges(subscriptionId: string, dbId: string, cursor: unknown): void {
+  startChanges(
+    subscriptionId: string,
+    dbId: string,
+    cursor: unknown,
+    options: { idPrefix?: string; metadataOnly?: boolean } = {},
+  ): void {
     const db = this.getDb(dbId);
     let disposed = false;
     let wake: (() => void) | null = null;
@@ -135,14 +141,15 @@ export class LiveRegistry {
       while (!disposed) {
         try {
           let advanced = false;
-          for await (const { doc, cursor: next } of db.iterateChangesSince(current)) {
+          const iterOptions = { idPrefix: options.idPrefix };
+          const items = options.metadataOnly
+            ? db.iterateChangeMetadataSince(current, iterOptions)
+            : db.iterateChangesSince(current, iterOptions);
+          for await (const item of items) {
             if (disposed) return;
-            current = next;
+            current = item.cursor;
             advanced = true;
-            this.emitter.sendEvent(subscriptionId, "change", {
-              doc: projectDocument(doc as never),
-              cursor: toPlainJson(next),
-            });
+            this.emitter.sendEvent(subscriptionId, "change", toChangeDto(item, Boolean(options.metadataOnly)));
           }
           // Once after the replay, then whenever a pass found nothing new.
           if (!reportedCaughtUp || !advanced) {
