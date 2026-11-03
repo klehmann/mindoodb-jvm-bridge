@@ -41,10 +41,14 @@ opening a session (bootstrap-token authorized, rate-limited alongside
 threadpool-backed, so it does not block the event loop — and never fork a child:
 
 - `tenant.create` — params
-  `{ tenantId, adminName, adminPassword, userName, userPassword, databases?, serverUrl? }`.
+  `{ tenantId?, tenantLabel?, adminName, adminPassword, userName, userPassword, databases?, serverUrl? }`.
   Creates a tenant + admin + app user, materializes each database, and writes a
-  password-locked identity bundle to disk. Returns
-  `{ tenantId, userId, adminUserId, databases, envDir, identityFile, adminIdentity }`.
+  password-locked identity bundle to disk. Without `tenantId` a random,
+  time-sortable id is generated (`generateTenantId`, as Haven does), so tenants
+  from different machines do not collide on a shared server. `tenantLabel` is the
+  human-readable name, stored field-encrypted in the directory's `tenantsetup`
+  document. Returns
+  `{ tenantId, tenantLabel, userId, adminUserId, databases, envDir, identityFile, adminIdentity }`.
   The caller can then `session.open` with `userId` + `password`. `adminIdentity`
   is the admin `PrivateUserId` (password-locked) for join approval.
 - `identity.createUser` — params `{ username, password }`. Creates a standalone
@@ -62,7 +66,8 @@ threadpool-backed, so it does not block the event loop — and never fork a chil
   pulls `directory` + `userdirectory` from the server (response `serverUrl` or
   the parameter) so the grant is local, opens `databases`, writes an identity
   bundle, returns
-  `{ tenantId, userId, databases, envDir, identityFile, serverUrl }`.
+  `{ tenantId, tenantLabel, userId, databases, envDir, identityFile, serverUrl }`
+  (`tenantLabel` as carried by the response; read the live one with `tenant.getLabel`).
 
 ## 2. JSON envelope
 
@@ -139,6 +144,10 @@ Close with `session.close` (or just drop the connection); the child is reaped.
   overrides the device label, `username` registers the device under an existing
   person. With a server URL the grant is pushed (`directory` + `userdirectory`)
   right away. Returns `{ format, joinResponse, pushed }`.
+- `tenant.getLabel` → `{ tenantId, label }` (any member, from the synced directory).
+- `tenant.setLabel` `{ label, adminPassword, adminIdentity? }` — rename the tenant
+  (admin only; `NotAuthorized` for members or a wrong password); pushes the
+  directory when a server URL is set. Returns `{ label, pushed }`.
 - `tenant.inspectJoinRequest` `{ joinRequest }` — decode a join request without
   approving it: `{ version, username, label, signingPublicKey, encryptionPublicKey,
   signingPublicKeyFingerprint, encryptionPublicKeyFingerprint, hasUserKey,

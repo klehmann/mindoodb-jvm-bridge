@@ -9,6 +9,7 @@
 import {
   BaseMindooTenantFactory,
   decodeMindooURI,
+  generateTenantId,
   isMindooURI,
   type PrivateUserId,
 } from "mindoodb";
@@ -22,7 +23,13 @@ import { pullSystemDatabases } from "./syncLoop";
 
 export interface ProvisionTenantInput {
   dataRoot: string;
-  tenantId: string;
+  /**
+   * Omit to get a random, time-sortable id like Haven's (`generateTenantId`),
+   * so tenants from different machines never collide on a shared server.
+   */
+  tenantId?: string;
+  /** Human-readable name, stored encrypted in the directory's `tenantsetup` document. */
+  tenantLabel?: string;
   adminName: string;
   adminPassword: string;
   userName: string;
@@ -33,6 +40,7 @@ export interface ProvisionTenantInput {
 
 export interface ProvisionTenantResult {
   tenantId: string;
+  tenantLabel: string | null;
   /** The app user's username (what `session.open` expects as `userId`). */
   userId: string;
   /** The admin user's username. */
@@ -54,18 +62,21 @@ export interface ProvisionTenantResult {
  */
 export async function provisionTenant(input: ProvisionTenantInput): Promise<ProvisionTenantResult> {
   const databases = input.databases ?? [];
-  const envDir = userEnvDir(input.dataRoot, input.tenantId, input.userName);
+  const tenantId = input.tenantId?.trim() || generateTenantId();
+  const tenantLabel = input.tenantLabel?.trim() || undefined;
+  const envDir = userEnvDir(input.dataRoot, tenantId, input.userName);
   const basePath = userStoreBasePath(envDir);
 
   const crypto = new NodeCryptoAdapter();
   const factory = new BaseMindooTenantFactory(new ScopedOnDiskStoreFactory(basePath), crypto);
 
   const result = await factory.createTenant({
-    tenantId: input.tenantId,
+    tenantId,
     adminName: input.adminName,
     adminPassword: input.adminPassword,
     userName: input.userName,
     userPassword: input.userPassword,
+    ...(tenantLabel ? { tenantLabel } : {}),
   });
 
   for (const dbId of databases) {
@@ -75,7 +86,7 @@ export async function provisionTenant(input: ProvisionTenantInput): Promise<Prov
   const keyBagBlob = await result.keyBag.save();
   const bundle: IdentityBundle = {
     version: 1,
-    tenantId: input.tenantId,
+    tenantId,
     username: input.userName,
     adminSigningPublicKey: result.adminUser.userSigningKeyPair.publicKey,
     adminEncryptionPublicKey: result.adminUser.userEncryptionKeyPair.publicKey,
@@ -88,7 +99,8 @@ export async function provisionTenant(input: ProvisionTenantInput): Promise<Prov
   writeIdentityBundle(identityFile, bundle);
 
   return {
-    tenantId: input.tenantId,
+    tenantId,
+    tenantLabel: tenantLabel ?? null,
     userId: input.userName,
     adminUserId: result.adminUser.username,
     databases,
@@ -169,6 +181,8 @@ export interface JoinTenantInput {
 
 export interface JoinTenantProvisionResult {
   tenantId: string;
+  /** The label the admin's response carried (the live label is in the directory). */
+  tenantLabel: string | null;
   userId: string;
   databases: string[];
   envDir: string;
@@ -230,6 +244,7 @@ export async function joinTenantAndPersist(input: JoinTenantInput): Promise<Join
 
   return {
     tenantId,
+    tenantLabel: responseMeta.tenantLabel ?? null,
     userId: input.user.username,
     databases,
     envDir,
@@ -258,11 +273,13 @@ function extractJoinResponseMeta(joinResponse: unknown): {
   adminSigningPublicKey: string;
   adminEncryptionPublicKey: string;
   serverUrl?: string;
+  tenantLabel?: string;
 } {
   let payload: {
     adminSigningPublicKey?: string;
     adminEncryptionPublicKey?: string;
     serverUrl?: string;
+    tenantLabel?: string;
   };
   if (typeof joinResponse === "string") {
     payload = decodeMindooURI(joinResponse).payload as typeof payload;
@@ -276,5 +293,6 @@ function extractJoinResponseMeta(joinResponse: unknown): {
     adminSigningPublicKey: payload.adminSigningPublicKey,
     adminEncryptionPublicKey: payload.adminEncryptionPublicKey,
     serverUrl: payload.serverUrl,
+    tenantLabel: typeof payload.tenantLabel === "string" ? payload.tenantLabel : undefined,
   };
 }
