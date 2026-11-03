@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.mindoodb-bridge-data/
+*.handshake.json

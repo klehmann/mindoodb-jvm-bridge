@@ -1,0 +1,152 @@
+import type { Emitter } from "./emitter";
+import { projectDocument, toPlainJson } from "./projections";
+import { log } from "../logging";
+
+interface LiveDb {
+  query?: (query: unknown, options?: unknown) => Promise<unknown>;
+  queryLive?: (
+    query: unknown,
+    onResult: (result: unknown) => void,
+    options?: { onError?: (error: unknown) => void } & Record<string, unknown>,
+  ) => { unsubscribe(): void; refresh(): void };
+  addChangeListener?: (listener: () => void) => () => void;
+  iterateChangesSince: (cursor: unknown, options?: unknown) => AsyncGenerator<{ doc: unknown; cursor: unknown }>;
+  getLatestChangeCursor?: () => unknown;
+}
+
+interface Subscription {
+  cancel(): void;
+}
+
+/**
+ * Owns the push subscriptions for one user session: live queries (query-result
+ * events), view-change notifications, and changefeed streaming. Each is tied to
+ * a subscriptionId and cancelled individually or all at once on session close.
+ */
+export class LiveRegistry {
+  private readonly subs = new Map<string, Subscription>();
+
+  constructor(
+    private readonly emitter: Emitter,
+    private readonly getDb: (dbId: string) => LiveDb,
+  ) {}
+
+  startQuery(subscriptionId: string, dbId: string, query: unknown, options?: unknown): void {
+    const db = this.getDb(dbId);
+    if (typeof db.queryLive === "function") {
+      const handle = db.queryLive(
+        query,
+        (result) => this.emitter.sendEvent(subscriptionId, "query-result", toPlainJson(result)),
+        {
+          ...(options as Record<string, unknown>),
+          onError: (error: unknown) =>
+            this.emitter.sendEvent(subscriptionId, "query-error", { message: String((error as Error)?.message ?? error) }),
+        },
+      );
+      this.subs.set(subscriptionId, { cancel: () => handle.unsubscribe() });
+      return;
+    }
+    // Fallback: re-run query on change events / interval and emit on change.
+    this.startPolledQuery(subscriptionId, db, query, options);
+  }
+
+  private startPolledQuery(subscriptionId: string, db: LiveDb, query: unknown, options?: unknown): void {
+    let lastJson = "";
+    let disposed = false;
+    const run = async (): Promise<void> => {
+      if (disposed || typeof db.query !== "function") return;
+      try {
+        const result = await db.query(query, options);
+        const json = JSON.stringify(toPlainJson(result));
+        if (json !== lastJson) {
+          lastJson = json;
+          this.emitter.sendEvent(subscriptionId, "query-result", JSON.parse(json));
+        }
+      } catch (err) {
+        this.emitter.sendEvent(subscriptionId, "query-error", { message: String((err as Error)?.message ?? err) });
+      }
+    };
+    const unsub = db.addChangeListener?.(() => void run());
+    const timer = unsub ? null : setInterval(() => void run(), 1500);
+    void run();
+    this.subs.set(subscriptionId, {
+      cancel: () => {
+        disposed = true;
+        unsub?.();
+        if (timer) clearInterval(timer);
+      },
+    });
+  }
+
+  /** View-change subscription: fire a lightweight event whenever the db changes. */
+  startViewWatch(subscriptionId: string, dbId: string): void {
+    const db = this.getDb(dbId);
+    const unsub = db.addChangeListener?.(() =>
+      this.emitter.sendEvent(subscriptionId, "view-changed", {}),
+    );
+    this.subs.set(subscriptionId, { cancel: () => unsub?.() });
+  }
+
+  /** Changefeed: stream every changed document from `cursor`, then follow live. */
+  startChanges(subscriptionId: string, dbId: string, cursor: unknown): void {
+    const db = this.getDb(dbId);
+    let disposed = false;
+    let wake: (() => void) | null = null;
+    const unsub = db.addChangeListener?.(() => wake?.());
+
+    const waitForChange = (): Promise<void> =>
+      new Promise<void>((resolve) => {
+        wake = resolve;
+        // Even without a change listener, poll periodically.
+        if (!unsub) setTimeout(resolve, 1500);
+      });
+
+    const loop = async (): Promise<void> => {
+      let current = cursor;
+      while (!disposed) {
+        try {
+          let advanced = false;
+          for await (const { doc, cursor: next } of db.iterateChangesSince(current)) {
+            if (disposed) return;
+            current = next;
+            advanced = true;
+            this.emitter.sendEvent(subscriptionId, "change", {
+              doc: projectDocument(doc as never),
+              cursor: toPlainJson(next),
+            });
+          }
+          if (!advanced) {
+            this.emitter.sendEvent(subscriptionId, "caught-up", { cursor: toPlainJson(current) });
+          }
+        } catch (err) {
+          log.warn("liveRegistry", "changefeed error", err);
+          this.emitter.sendEvent(subscriptionId, "change-error", {
+            message: String((err as Error)?.message ?? err),
+          });
+        }
+        if (disposed) return;
+        await waitForChange();
+      }
+    };
+
+    void loop();
+    this.subs.set(subscriptionId, {
+      cancel: () => {
+        disposed = true;
+        unsub?.();
+        wake?.();
+      },
+    });
+  }
+
+  stop(subscriptionId: string): void {
+    const sub = this.subs.get(subscriptionId);
+    if (!sub) return;
+    sub.cancel();
+    this.subs.delete(subscriptionId);
+  }
+
+  disposeAll(): void {
+    for (const id of [...this.subs.keys()]) this.stop(id);
+  }
+}
