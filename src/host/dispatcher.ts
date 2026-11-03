@@ -1,5 +1,8 @@
 import {
   USER_DIRECTORY_DB_ID,
+  decodeJoinRequestUri,
+  fingerprintPublicKeyPem,
+  type JoinRequest,
   VirtualViewFactory,
   type EncryptedPrivateKey,
   type MindooDocumentUpdate,
@@ -107,6 +110,16 @@ export class Dispatcher {
         return this.publishToServer(p);
       case Methods.tenantApproveJoinRequest:
         return this.approveJoinRequest(p);
+      case Methods.tenantInspectJoinRequest:
+        return this.inspectJoinRequest(p);
+      case Methods.sessionWatchSync:
+        this.syncLoop.watchProgress(p.subscriptionId as string, (payload) =>
+          this.emitter.sendEvent(p.subscriptionId as string, "sync-progress", payload),
+        );
+        return { ok: true };
+      case Methods.sessionUnwatchSync:
+        this.syncLoop.unwatchProgress(p.subscriptionId as string);
+        return { ok: true };
       case Methods.keybagCreateDocKey:
         return this.createDocKey(p);
       case Methods.keybagListKeys:
@@ -467,6 +480,52 @@ export class Dispatcher {
     // sync once it is on the server.
     const pushed = this.env.serverUrl ? await this.pushSystemDatabases(adminUser, adminPassword) : [];
     return { format, joinResponse, pushed };
+  }
+
+  /**
+   * What an admin needs to decide on a join request before approving it: who
+   * asks, for which device, with which keys (fingerprints to compare with the
+   * joining device), and whether the name or the device is already known.
+   */
+  private async inspectJoinRequest(p: Params): Promise<unknown> {
+    const raw = p.joinRequest;
+    if (raw == null) throw new BridgeError(ErrorCodes.BadRequest, "tenant.inspectJoinRequest requires joinRequest");
+    let request: JoinRequest;
+    try {
+      request = typeof raw === "string" ? decodeJoinRequestUri(raw) : (raw as JoinRequest);
+    } catch (err) {
+      throw new BridgeError(ErrorCodes.BadRequest, `Not a join request: ${(err as Error).message}`);
+    }
+    const subtle = globalThis.crypto.subtle;
+    const username = request.username ?? null;
+    let directoryUser: { exists: boolean; deviceAlreadyGranted: boolean; devices: unknown[] } | null = null;
+    if (username) {
+      const directory = await this.env.tenant.openDirectory();
+      const pairs = (await directory.getUserKeyPairs?.(username)) ?? [];
+      directoryUser = {
+        exists: pairs.length > 0,
+        deviceAlreadyGranted: pairs.some((pair) => pair.signingPublicKey === request.signingPublicKey),
+        devices: await Promise.all(
+          pairs.map(async (pair) => ({
+            label: pair.label ?? null,
+            signingPublicKeyFingerprint: await fingerprintPublicKeyPem(pair.signingPublicKey, subtle),
+            wipeRequested: pair.wipeRequested,
+          })),
+        ),
+      };
+    }
+    return {
+      version: request.v,
+      username,
+      label: request.label ?? null,
+      signingPublicKey: request.signingPublicKey,
+      encryptionPublicKey: request.encryptionPublicKey,
+      signingPublicKeyFingerprint: await fingerprintPublicKeyPem(request.signingPublicKey, subtle),
+      encryptionPublicKeyFingerprint: await fingerprintPublicKeyPem(request.encryptionPublicKey, subtle),
+      hasUserKey: Boolean(request.userPublicKey),
+      requestedDocKeyIds: request.requestedDocKeyIds ?? null,
+      directoryUser,
+    };
   }
 
   /** Push `directory` and `userdirectory`, authenticated as the tenant admin when known. */

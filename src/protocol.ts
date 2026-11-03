@@ -135,6 +135,9 @@ export const Methods = {
   sessionPublishToServer: "session.publishToServer",
 
   tenantApproveJoinRequest: "tenant.approveJoinRequest",
+  tenantInspectJoinRequest: "tenant.inspectJoinRequest",
+  sessionWatchSync: "session.watchSync",
+  sessionUnwatchSync: "session.unwatchSync",
 
   keybagCreateDocKey: "keybag.createDocKey",
   keybagListKeys: "keybag.listKeys",
