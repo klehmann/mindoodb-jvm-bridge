@@ -59,11 +59,20 @@ Summary:
 ## Requirements
 
 - Node.js `>=22.13.0`
-- Workspace packages: `mindoodb`, `ws` (and `mindoodb-app-sdk` for types)
+- `mindoodb` from npm (or the sibling package inside the MindooDB workspace) and `ws`
 
 ## Build & run
 
-From the workspace root:
+Standalone, next to a clone of the Kotlin client:
+
+```bash
+git clone https://github.com/klehmann/mindoodb-jvm-bridge.git
+cd mindoodb-jvm-bridge
+npm install
+npm run build      # → dist/index.js, dist/provision.js
+```
+
+Inside the MindooDB workspace (links the local `mindoodb` package), from the workspace root:
 
 ```bash
 pnpm --filter mindoodb-jvm-bridge install
