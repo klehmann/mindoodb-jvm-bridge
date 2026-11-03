@@ -22,11 +22,10 @@
     "e2e": "node scripts/e2e/server-sync.mjs"
   },
   "dependencies": {
-    "mindoodb": "workspace:*",
+    "mindoodb": ">=0.0.85 <0.1.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {
-    "mindoodb-app-sdk": "workspace:*",
     "@types/node": "^22.10.0",
     "@types/ws": "^8.5.13",
     "tsx": "^4.19.2",
