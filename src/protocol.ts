@@ -179,6 +179,8 @@ export const Methods = {
   streamCreditRpc: "stream.credit",
 
   changesIterateSince: "changes.iterateSince",
+  changesRead: "changes.read",
+  changesCount: "changes.count",
 } as const;
 
 export type MethodName = (typeof Methods)[keyof typeof Methods];

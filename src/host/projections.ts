@@ -108,3 +108,16 @@ export function toPlainJson(value: unknown, seen = new WeakSet<object>()): unkno
   }
   return out;
 }
+
+/** A changefeed item on the wire: `{ doc, cursor }` or `{ meta, cursor }`. */
+export function toChangeDto(item: unknown, metadataOnly: boolean): unknown {
+  if (metadataOnly) {
+    const m = item as { docId: string; lastModified: number; isDeleted: boolean; cursor: unknown };
+    return {
+      meta: { docId: m.docId, lastModified: m.lastModified, isDeleted: m.isDeleted },
+      cursor: toPlainJson(m.cursor),
+    };
+  }
+  const c = item as { doc: unknown; cursor: unknown };
+  return { doc: projectDocument(c.doc as never), cursor: toPlainJson(c.cursor) };
+}

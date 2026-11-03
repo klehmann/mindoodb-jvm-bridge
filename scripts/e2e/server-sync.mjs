@@ -206,6 +206,40 @@ try {
     await alice.call("db.liveQuery.stop", { subscriptionId: "lq1" });
   });
 
+  await step("incremental reads (pages, metadata, count, idPrefix)", async () => {
+    for (let i = 0; i < 5; i++) {
+      await alice.call("documents.create", { db: "notes", options: { idPrefix: "inv", initialValues: { type: "invoice", n: i } } });
+    }
+    const total = (await alice.call("changes.count", { db: "notes", cursor: null })).count;
+    const inv = (await alice.call("changes.count", { db: "notes", cursor: null, idPrefix: "inv" })).count;
+    assert(inv === 5 && total > inv, `count all=${total}, inv=${inv}`);
+    // page through invoices, 2 at a time, keeping only the cursor
+    let cursor = null, seen = [], pages = 0, done = false;
+    while (!done) {
+      const page = await alice.call("changes.read", { db: "notes", cursor, limit: 2, idPrefix: "inv" });
+      seen.push(...page.changes.map((c) => c.doc.data.n));
+      cursor = page.cursor; done = page.done; pages++;
+    }
+    assert(seen.length === 5 && pages === 3, `paged ${pages} pages: ${seen}`);
+    const empty = await alice.call("changes.read", { db: "notes", cursor, idPrefix: "inv" });
+    assert(empty.changes.length === 0 && empty.done, "nothing new after the saved cursor");
+    // a change after the saved cursor shows up, once
+    const first = (await alice.call("changes.read", { db: "notes", cursor: null, limit: 1, idPrefix: "inv" })).changes[0];
+    await alice.call("documents.update", { db: "notes", docId: first.doc.id, operations: [{ op: "set", path: ["paid"], value: true }] });
+    const next = await alice.call("changes.read", { db: "notes", cursor, idPrefix: "inv" });
+    assert(next.changes.length === 1 && next.changes[0].doc.data.paid === true, "resume from saved cursor");
+    const meta = await alice.call("changes.read", { db: "notes", cursor: null, metadataOnly: true, limit: 100 });
+    assert(meta.changes.every((c) => c.meta?.docId && !c.doc) && meta.changes.length === total, "metadata-only pages: " + meta.changes.length);
+    assert((await alice.call("changes.count", { db: "notes", cursor: meta.cursor })).count === 0, "count after head is 0");
+    const metaEvents = [];
+    alice.subs.set("cfm", (ev, p) => { if (ev === "change") metaEvents.push(p); });
+    await alice.call("changes.iterateSince", { db: "notes", subscriptionId: "cfm", cursor: meta.cursor, metadataOnly: true, idPrefix: "inv" });
+    await alice.call("documents.update", { db: "notes", docId: first.doc.id, operations: [{ op: "set", path: ["paid"], value: false }] });
+    await new Promise((r) => setTimeout(r, 1500));
+    await alice.call("db.liveQuery.stop", { subscriptionId: "cfm" });
+    assert(metaEvents.length === 1 && metaEvents[0].meta.docId === first.doc.id, "live metadata changefeed with idPrefix");
+  });
+
   await step("keybag", async () => {
     const k = await alice.call("keybag.createDocKey", { keyId: "finance" });
     assert(k.keys.includes("finance") || JSON.stringify(k).includes("finance"), "createDocKey");

@@ -208,8 +208,18 @@ update; without it, call `refresh`. `nav.dispose` releases the view.
 Full-text: `fulltext.getSetup`, `fulltext.setSetup`. Full-text search is a
 `text` clause on `db.query` (adds `textScore` per row).
 
-Changefeed: `changes.iterateSince` (`{ db, subscriptionId, cursor }`) streams
-`change` events, then `caught-up`, then follows live.
+Changefeed:
+- `changes.iterateSince` (`{ db, subscriptionId, cursor, idPrefix?, metadataOnly? }`)
+  streams `change` events, then `caught-up`, then follows live.
+- `changes.read` (`{ db, cursor, limit?, idPrefix?, metadataOnly? }`) returns one
+  page up to the current end of the feed: `{ changes, cursor, done }`; no live part.
+  `limit` defaults to 100 (max 10,000).
+- `changes.count` (`{ db, cursor, idPrefix? }`) → `{ count }` of changes after `cursor`.
+
+Change items are `{ doc, cursor }`, or with `metadataOnly` `{ meta: { docId,
+lastModified, isDeleted }, cursor }` (nothing is decrypted). `idPrefix` skips other
+documents before they are loaded. A cursor is an opaque JSON object: store it as
+is and pass it back; `null` starts from the beginning.
 
 Attachments: `attachments.list`, `attachments.remove`,
 `attachments.openReadStream`, `attachments.openWriteStream`,

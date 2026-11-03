@@ -18,7 +18,7 @@ import type { Emitter } from "./emitter";
 import { NavigatorRegistry, type CoreNavigator } from "./navigatorRegistry";
 import { StreamRegistry } from "./streamRegistry";
 import { LiveRegistry } from "./liveRegistry";
-import { projectDocument, toPlainJson } from "./projections";
+import { projectDocument, toChangeDto, toPlainJson } from "./projections";
 
 type Path = Array<string | number>;
 
@@ -248,8 +248,20 @@ export class Dispatcher {
         return { ok: true };
 
       case Methods.changesIterateSince:
-        this.liveReg.startChanges(p.subscriptionId as string, p.db as string, p.cursor ?? null);
+        this.liveReg.startChanges(p.subscriptionId as string, p.db as string, p.cursor ?? null, {
+          idPrefix: p.idPrefix as string | undefined,
+          metadataOnly: Boolean(p.metadataOnly),
+        });
         return { ok: true };
+      case Methods.changesRead:
+        return this.readChanges(p);
+      case Methods.changesCount: {
+        const db = this.db(p.db as string);
+        if (typeof db.countChangesSince !== "function") {
+          throw new BridgeError(ErrorCodes.BadRequest, "Counting changes is not available on this database");
+        }
+        return { count: db.countChangesSince((p.cursor ?? null) as never, { idPrefix: p.idPrefix as string | undefined }) };
+      }
 
       default:
         throw new BridgeError(ErrorCodes.BadRequest, `Unknown method: ${method}`);
@@ -327,6 +339,34 @@ export class Dispatcher {
       heads: result.heads,
       conflictExpected: baseHeads ? !headsEqual(baseHeads, headsBefore) : undefined,
     };
+  }
+
+  /**
+   * One page of the changefeed after `cursor`: up to `limit` documents (or,
+   * with `metadataOnly`, their id/deleted/lastModified without decrypting),
+   * plus the cursor to resume from and whether the feed is exhausted.
+   */
+  private async readChanges(p: Params): Promise<{ changes: unknown[]; cursor: unknown; done: boolean }> {
+    const db = this.db(p.db as string);
+    const limit = Math.max(1, Math.min(Number(p.limit ?? 100), 10_000));
+    const options = { idPrefix: p.idPrefix as string | undefined };
+    let cursor = (p.cursor ?? null) as unknown;
+    const changes: unknown[] = [];
+    const iterator = p.metadataOnly
+      ? db.iterateChangeMetadataSince(cursor as never, options)
+      : db.iterateChangesSince(cursor as never, options);
+    let done = true;
+    for await (const item of iterator) {
+      if (changes.length >= limit) {
+        // One look-ahead tells us more is waiting; it is read again next time.
+        done = false;
+        break;
+      }
+      cursor = item.cursor;
+      changes.push(toChangeDto(item, Boolean(p.metadataOnly)));
+    }
+    await iterator.return?.(undefined);
+    return { changes, cursor: toPlainJson(cursor), done };
   }
 
   private async listHistory(p: Params): Promise<{ history: unknown[] }> {
