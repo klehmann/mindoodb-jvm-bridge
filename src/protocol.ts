@@ -135,6 +135,9 @@ export const Methods = {
   sessionPublishToServer: "session.publishToServer",
 
   tenantApproveJoinRequest: "tenant.approveJoinRequest",
+  tenantInspectJoinRequest: "tenant.inspectJoinRequest",
+  sessionWatchSync: "session.watchSync",
+  sessionUnwatchSync: "session.unwatchSync",
 
   keybagCreateDocKey: "keybag.createDocKey",
   keybagListKeys: "keybag.listKeys",
@@ -149,6 +152,9 @@ export const Methods = {
   docDelete: "documents.delete",
   docDeleteMany: "documents.deleteMany",
   docListDeleted: "documents.listDeleted",
+  docGetRichText: "documents.getRichText",
+  docGetTextCursors: "documents.getTextCursors",
+  docResolveTextCursors: "documents.resolveTextCursors",
   docUndelete: "documents.undelete",
   docListHistory: "documents.listHistory",
   docGetAtRevision: "documents.getAtRevision",
@@ -176,6 +182,8 @@ export const Methods = {
   streamCreditRpc: "stream.credit",
 
   changesIterateSince: "changes.iterateSince",
+  changesRead: "changes.read",
+  changesCount: "changes.count",
 } as const;
 
 export type MethodName = (typeof Methods)[keyof typeof Methods];

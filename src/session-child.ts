@@ -85,7 +85,9 @@ async function handleOpen(m: Extract<FromSupervisor, { t: "open" }>): Promise<vo
       identityFile: identityFilePath(envDir),
     });
     syncLoop = new SyncLoop(env);
-    syncLoop.start();
+    // First background sync after one interval, so a client can subscribe to
+    // sync progress (or run refresh itself) before the first big pull starts.
+    syncLoop.start({ immediate: false });
     dispatcher = new Dispatcher(env, syncLoop, emitter);
     toSupervisor({
       t: "opened",

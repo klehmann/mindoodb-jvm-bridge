@@ -139,6 +139,17 @@ Close with `session.close` (or just drop the connection); the child is reaped.
   overrides the device label, `username` registers the device under an existing
   person. With a server URL the grant is pushed (`directory` + `userdirectory`)
   right away. Returns `{ format, joinResponse, pushed }`.
+- `tenant.inspectJoinRequest` `{ joinRequest }` — decode a join request without
+  approving it: `{ version, username, label, signingPublicKey, encryptionPublicKey,
+  signingPublicKeyFingerprint, encryptionPublicKeyFingerprint, hasUserKey,
+  requestedDocKeyIds, directoryUser: { exists, deviceAlreadyGranted, devices } | null }`.
+  Fingerprints use MindooDB's `fingerprintPublicKeyPem` (the format Haven shows).
+- `session.watchSync` `{ subscriptionId }` / `session.unwatchSync` — `sync-progress`
+  events for every push and pull of the session (refresh, publish, approval,
+  background): `{ dbId, direction, store, phase, message, scannedEntries,
+  transferredEntries, transferredBytes, totalSourceEntries, background }`. Each
+  push/pull ends with `phase: "complete"`. The background loop starts one interval
+  (5 s) after `session.open`, so a client can subscribe before the first pull.
 - `keybag.createDocKey` `{ keyId }`, `keybag.listKeys`, `keybag.persist` —
   create/list/re-save KeyBag doc keys (create auto-persists the identity bundle).
 
@@ -162,12 +173,28 @@ of a convergent ID fixed).
 where `UpdateOp` is `{op:"set",path,value}`, `{op:"unset",path}`,
 `{op:"merge",value}`, `{op:"setText",path,value}`,
 `{op:"textSplice",path,index,deleteCount,insert?}`, `{op:"increment",path,delta}`,
-`{op:"listInsert",path,index,values}` or `{op:"listDelete",path,index,deleteCount}`.
-All operations become one JSON patch (`applyDocumentUpdate`), applied by group
-(set, unset, list, text, counter), not in list order. Values may be MindooDB
+`{op:"listInsert",path,index,values}`, `{op:"listDelete",path,index,deleteCount}`,
+`{op:"textMark",path,index,length,marks}`, `{op:"textUnmark",path,index,length,names}`,
+`{op:"richText",path,spans|spansSequence,updateSpansConfig?}` (replace a rich-text
+field's spans; MindooDB diffs them, creates the field when missing) or
+`{op:"richTextSteps",path,steps:[{type:"splice",index,deleteCount,insert?,marks?:[{index,length,marks}]}]}`.
+All operations go into one `applyDocumentUpdate`: the JSON ops as one JSON patch
+applied by group (set, unset, list, text, counter, marks), not in list order;
+each rich-text op as its own rich-text patch, all at the same `baseHeads`. Values may be MindooDB
 typed values: `{"$mindoo":"atomic","value":"open"}` (a string concurrent
 changes cannot mix), `{"$mindoo":"counter","value":0}`,
 `{"$mindoo":"timestamp","value":<ms>}`; a plain string is collaborative text.
+
+Rich text and cursors:
+- `documents.getRichText` `{ db, docId, path }` → `{ path, heads, spans }`, spans
+  `{type:"text",value,marks?}` / `{type:"block",value}`. `documents.get` returns
+  only the plain string (a block is `\uFFFC`, marks are dropped). Use `heads` as
+  `baseHeads` of the next edit.
+- `documents.getTextCursors` `{ db, docId, path, positions: (number|"start"|"end")[], heads? }`
+  → `{ path, heads, cursors }`: opaque strings that keep pointing at the same
+  character while text changes (store them as atomic strings).
+- `documents.resolveTextCursors` `{ db, docId, path, cursors, heads? }` →
+  `{ path, heads, positions }`, current or at `heads`.
 With `baseHeads` the patch is made against that version and merged into the
 current one; `conflictExpected` flags that the document had moved on. Returns
 `{ heads, conflictExpected? }`.
@@ -192,8 +219,18 @@ update; without it, call `refresh`. `nav.dispose` releases the view.
 Full-text: `fulltext.getSetup`, `fulltext.setSetup`. Full-text search is a
 `text` clause on `db.query` (adds `textScore` per row).
 
-Changefeed: `changes.iterateSince` (`{ db, subscriptionId, cursor }`) streams
-`change` events, then `caught-up`, then follows live.
+Changefeed:
+- `changes.iterateSince` (`{ db, subscriptionId, cursor, idPrefix?, metadataOnly? }`)
+  streams `change` events, then `caught-up`, then follows live.
+- `changes.read` (`{ db, cursor, limit?, idPrefix?, metadataOnly? }`) returns one
+  page up to the current end of the feed: `{ changes, cursor, done }`; no live part.
+  `limit` defaults to 100 (max 10,000).
+- `changes.count` (`{ db, cursor, idPrefix? }`) → `{ count }` of changes after `cursor`.
+
+Change items are `{ doc, cursor }`, or with `metadataOnly` `{ meta: { docId,
+lastModified, isDeleted }, cursor }` (nothing is decrypted). `idPrefix` skips other
+documents before they are loaded. A cursor is an opaque JSON object: store it as
+is and pass it back; `null` starts from the beginning.
 
 Attachments: `attachments.list`, `attachments.remove`,
 `attachments.openReadStream`, `attachments.openWriteStream`,
@@ -238,6 +275,7 @@ starting the subscription:
 
 - live query: `query-result` (payload = `MindooQueryResult`), `query-error`.
 - navigator watch: `view-changed`.
+- sync progress: `sync-progress` (see `session.watchSync`).
 - changefeed: `change` (`{ doc, cursor }`), `caught-up` (after the replay and
   whenever a pass finds nothing new), `change-error`.
 - session lifecycle: `session-crashed` (child exited unexpectedly; re-open).

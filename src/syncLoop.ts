@@ -4,6 +4,7 @@ import {
   type MindooDB,
   type MindooTenant,
   type SyncOptions,
+  type SyncProgress,
   type SyncResult,
 } from "mindoodb";
 import type { SessionEnv } from "./sessionEnv";
@@ -27,6 +28,21 @@ export interface RefreshResult {
   /** True when at least one entry was pushed to the server. */
   pushed: boolean;
   databases: DatabaseSyncResult[];
+}
+
+/** One `sync-progress` event: MindooDB's SyncProgress for one database, store and direction. */
+export interface SyncProgressEvent {
+  dbId: string;
+  direction: "pull" | "push";
+  store: "docs" | "attachments";
+  phase: SyncProgress["phase"];
+  message: string;
+  scannedEntries: number;
+  transferredEntries: number;
+  transferredBytes: number;
+  totalSourceEntries: number | null;
+  /** True for the periodic background sync, false for refresh/publish/approve. */
+  background: boolean;
 }
 
 /** Tenant databases every replica tracks, like Haven does (grants, key wraps, user keys). */
@@ -61,6 +77,7 @@ export class SyncLoop {
   /** Serializes background ticks and explicit refreshes so two syncs never overlap. */
   private queue: Promise<unknown> = Promise.resolve();
   private readonly remotes = new Map<string, ContentAddressedStore>();
+  private readonly progressWatchers = new Map<string, (event: SyncProgressEvent) => void>();
 
   constructor(
     private readonly env: SessionEnv,
@@ -69,19 +86,72 @@ export class SyncLoop {
     this.env.onServerUrlChange((url) => {
       this.remotes.clear();
       if (url) {
-        if (!this.timer && !this.stopped) this.start();
+        // No immediate tick: publishToServer still has to push the directory,
+        // and a sync before that is refused by the server (USER_REVOKED).
+        if (!this.timer && !this.stopped) this.start({ immediate: false });
       } else {
         this.pauseTimer();
       }
     });
   }
 
-  start(): void {
+  watchProgress(id: string, listener: (event: SyncProgressEvent) => void): void {
+    this.progressWatchers.set(id, listener);
+  }
+
+  unwatchProgress(id: string): void {
+    this.progressWatchers.delete(id);
+  }
+
+  /**
+   * Run one push or pull and report its progress to the watchers. MindooDB
+   * skips the final "complete" event when there was nothing to do, so one is
+   * sent from the result then: every call ends with "complete".
+   */
+  private async tracked(
+    dbId: string,
+    direction: "pull" | "push",
+    kind: StoreKind,
+    background: boolean,
+    run: (onProgress: ((p: SyncProgress) => void) | undefined) => Promise<SyncResult>,
+  ): Promise<SyncResult> {
+    if (this.progressWatchers.size === 0) return run(undefined);
+    let completed = false;
+    const emit = (p: SyncProgress): void => {
+      if (p.phase === "complete") completed = true;
+      const event: SyncProgressEvent = {
+        dbId,
+        direction,
+        store: kind === StoreKind.attachments ? "attachments" : "docs",
+        phase: p.phase,
+        message: p.message,
+        scannedEntries: p.scannedEntries,
+        transferredEntries: p.transferredEntries,
+        transferredBytes: p.transferredBytes ?? 0,
+        totalSourceEntries: p.totalSourceEntries ?? null,
+        background,
+      };
+      for (const listener of this.progressWatchers.values()) listener(event);
+    };
+    const result = await run(emit);
+    if (!completed) {
+      emit({
+        phase: "complete",
+        message: `${direction === "pull" ? "Pull" : "Push"} complete: ${result.transferredEntries} entries`,
+        transferredEntries: result.transferredEntries,
+        transferredBytes: result.transferredBytes,
+        scannedEntries: result.scannedEntries,
+      } as SyncProgress);
+    }
+    return result;
+  }
+
+  start(options: { immediate?: boolean } = {}): void {
     if (!this.env.serverUrl || this.timer || this.stopped) return;
     this.timer = setInterval(() => {
       void this.tick();
     }, this.intervalMs);
-    void this.tick();
+    if (options.immediate !== false) void this.tick();
   }
 
   private pauseTimer(): void {
@@ -101,7 +171,7 @@ export class SyncLoop {
     if (this.stopped) return;
     await this.serialized(async () => {
       for (const dbId of this.syncedDatabaseIds()) {
-        await this.syncDb(dbId, "both").catch((err) => log.warn("syncLoop", `sync ${dbId} failed`, err));
+        await this.syncDb(dbId, "both", true).catch((err) => log.warn("syncLoop", `sync ${dbId} failed`, err));
       }
     });
   }
@@ -140,13 +210,18 @@ export class SyncLoop {
       const result = emptyResult(dbId);
       for (const kind of [StoreKind.docs, StoreKind.attachments]) {
         const remote = await this.env.tenant.connectToServer(this.env.serverUrl!, dbId, kind);
-        addPush(result, await db.pushChangesTo(remote, { ...options, storeKind: kind }));
+        addPush(
+          result,
+          await this.tracked(dbId, "push", kind, false, (onProgress) =>
+            db.pushChangesTo(remote, { ...options, storeKind: kind, onProgress }),
+          ),
+        );
       }
       return result;
     });
   }
 
-  private async syncDb(dbId: string, direction: SyncDirection): Promise<DatabaseSyncResult | null> {
+  private async syncDb(dbId: string, direction: SyncDirection, background = false): Promise<DatabaseSyncResult | null> {
     if (!this.env.serverUrl) {
       return null;
     }
@@ -157,9 +232,18 @@ export class SyncLoop {
     const result = emptyResult(dbId);
     for (const kind of [StoreKind.docs, StoreKind.attachments]) {
       const remote = await this.getRemote(dbId, kind);
-      if (direction !== "pull") addPush(result, await db.pushChangesTo(remote, { storeKind: kind }));
+      if (direction !== "pull") {
+        addPush(
+          result,
+          await this.tracked(dbId, "push", kind, background, (onProgress) =>
+            db.pushChangesTo(remote, { storeKind: kind, onProgress }),
+          ),
+        );
+      }
       if (direction !== "push") {
-        const pull = await db.pullChangesFrom(remote, { storeKind: kind });
+        const pull = await this.tracked(dbId, "pull", kind, background, (onProgress) =>
+          db.pullChangesFrom(remote, { storeKind: kind, onProgress }),
+        );
         result.pulledEntries += pull.transferredEntries;
       }
     }
@@ -182,6 +266,7 @@ export class SyncLoop {
   stop(): void {
     this.stopped = true;
     this.pauseTimer();
+    this.progressWatchers.clear();
     this.remotes.clear();
   }
 }

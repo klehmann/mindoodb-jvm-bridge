@@ -1,9 +1,17 @@
 import {
   USER_DIRECTORY_DB_ID,
+  decodeJoinRequestUri,
+  fingerprintPublicKeyPem,
+  type JoinRequest,
   VirtualViewFactory,
   type EncryptedPrivateKey,
   type MindooDocumentUpdate,
   type MindooJsonPatch,
+  type MindooRichTextMaterializeValue,
+  type MindooRichTextPatch,
+  type MindooRichTextStep,
+  type MindooRichTextStepPatch,
+  type MindooTextCursorPosition,
   type PrivateUserId,
 } from "mindoodb";
 import { BridgeError, ErrorCodes, Methods } from "../protocol";
@@ -13,7 +21,7 @@ import type { Emitter } from "./emitter";
 import { NavigatorRegistry, type CoreNavigator } from "./navigatorRegistry";
 import { StreamRegistry } from "./streamRegistry";
 import { LiveRegistry } from "./liveRegistry";
-import { projectDocument, toPlainJson } from "./projections";
+import { projectDocument, toChangeDto, toPlainJson } from "./projections";
 
 type Path = Array<string | number>;
 
@@ -30,7 +38,11 @@ type UpdateOp =
   | { op: "textSplice"; path: Path; index: number; deleteCount: number; insert?: string }
   | { op: "increment"; path: Path; delta: number }
   | { op: "listInsert"; path: Path; index: number; values: unknown[] }
-  | { op: "listDelete"; path: Path; index: number; deleteCount: number };
+  | { op: "listDelete"; path: Path; index: number; deleteCount: number }
+  | { op: "textMark"; path: Path; index: number; length: number; marks: Record<string, MindooRichTextMaterializeValue> }
+  | { op: "textUnmark"; path: Path; index: number; length: number; names: string[] }
+  | ({ op: "richText" } & Omit<MindooRichTextPatch, "baseHeads">)
+  | { op: "richTextSteps"; path: Path; steps: MindooRichTextStep[] };
 
 interface Params {
   [key: string]: unknown;
@@ -98,6 +110,16 @@ export class Dispatcher {
         return this.publishToServer(p);
       case Methods.tenantApproveJoinRequest:
         return this.approveJoinRequest(p);
+      case Methods.tenantInspectJoinRequest:
+        return this.inspectJoinRequest(p);
+      case Methods.sessionWatchSync:
+        this.syncLoop.watchProgress(p.subscriptionId as string, (payload) =>
+          this.emitter.sendEvent(p.subscriptionId as string, "sync-progress", payload),
+        );
+        return { ok: true };
+      case Methods.sessionUnwatchSync:
+        this.syncLoop.unwatchProgress(p.subscriptionId as string);
+        return { ok: true };
       case Methods.keybagCreateDocKey:
         return this.createDocKey(p);
       case Methods.keybagListKeys:
@@ -131,6 +153,28 @@ export class Dispatcher {
       case Methods.docUndelete:
         await this.db(p.db as string).undeleteDocument(p.docId as string, p.options as never);
         return { ok: true };
+      case Methods.docGetRichText: {
+        const db = this.db(p.db as string);
+        return toPlainJson(await db.getRichTextSnapshot(await db.getDocument(p.docId as string), p.path as Path));
+      }
+      case Methods.docGetTextCursors: {
+        const db = this.db(p.db as string);
+        return db.getTextCursors(
+          await db.getDocument(p.docId as string),
+          p.path as Path,
+          (p.positions as MindooTextCursorPosition[]) ?? [],
+          p.heads ? { heads: p.heads as string[] } : undefined,
+        );
+      }
+      case Methods.docResolveTextCursors: {
+        const db = this.db(p.db as string);
+        return db.resolveTextCursors(
+          await db.getDocument(p.docId as string),
+          p.path as Path,
+          (p.cursors as string[]) ?? [],
+          p.heads ? { heads: p.heads as string[] } : undefined,
+        );
+      }
       case Methods.docListHistory:
         return this.listHistory(p);
       case Methods.docGetAtRevision: {
@@ -217,8 +261,20 @@ export class Dispatcher {
         return { ok: true };
 
       case Methods.changesIterateSince:
-        this.liveReg.startChanges(p.subscriptionId as string, p.db as string, p.cursor ?? null);
+        this.liveReg.startChanges(p.subscriptionId as string, p.db as string, p.cursor ?? null, {
+          idPrefix: p.idPrefix as string | undefined,
+          metadataOnly: Boolean(p.metadataOnly),
+        });
         return { ok: true };
+      case Methods.changesRead:
+        return this.readChanges(p);
+      case Methods.changesCount: {
+        const db = this.db(p.db as string);
+        if (typeof db.countChangesSince !== "function") {
+          throw new BridgeError(ErrorCodes.BadRequest, "Counting changes is not available on this database");
+        }
+        return { count: db.countChangesSince((p.cursor ?? null) as never, { idPrefix: p.idPrefix as string | undefined }) };
+      }
 
       default:
         throw new BridgeError(ErrorCodes.BadRequest, `Unknown method: ${method}`);
@@ -290,14 +346,40 @@ export class Dispatcher {
     const headsBefore = doc.getHeads();
     const baseHeads = p.baseHeads as string[] | undefined;
     const ops = (p.operations as UpdateOp[]) ?? [];
-    const json = toJsonPatch(ops);
-    if (baseHeads && baseHeads.length > 0) json.baseHeads = baseHeads;
-    const update: MindooDocumentUpdate = { json };
+    const update = toDocumentUpdate(ops, baseHeads && baseHeads.length > 0 ? baseHeads : undefined);
     const result = await db.applyDocumentUpdate(doc, update, p.options as never);
     return {
       heads: result.heads,
       conflictExpected: baseHeads ? !headsEqual(baseHeads, headsBefore) : undefined,
     };
+  }
+
+  /**
+   * One page of the changefeed after `cursor`: up to `limit` documents (or,
+   * with `metadataOnly`, their id/deleted/lastModified without decrypting),
+   * plus the cursor to resume from and whether the feed is exhausted.
+   */
+  private async readChanges(p: Params): Promise<{ changes: unknown[]; cursor: unknown; done: boolean }> {
+    const db = this.db(p.db as string);
+    const limit = Math.max(1, Math.min(Number(p.limit ?? 100), 10_000));
+    const options = { idPrefix: p.idPrefix as string | undefined };
+    let cursor = (p.cursor ?? null) as unknown;
+    const changes: unknown[] = [];
+    const iterator = p.metadataOnly
+      ? db.iterateChangeMetadataSince(cursor as never, options)
+      : db.iterateChangesSince(cursor as never, options);
+    let done = true;
+    for await (const item of iterator) {
+      if (changes.length >= limit) {
+        // One look-ahead tells us more is waiting; it is read again next time.
+        done = false;
+        break;
+      }
+      cursor = item.cursor;
+      changes.push(toChangeDto(item, Boolean(p.metadataOnly)));
+    }
+    await iterator.return?.(undefined);
+    return { changes, cursor: toPlainJson(cursor), done };
   }
 
   private async listHistory(p: Params): Promise<{ history: unknown[] }> {
@@ -400,6 +482,52 @@ export class Dispatcher {
     return { format, joinResponse, pushed };
   }
 
+  /**
+   * What an admin needs to decide on a join request before approving it: who
+   * asks, for which device, with which keys (fingerprints to compare with the
+   * joining device), and whether the name or the device is already known.
+   */
+  private async inspectJoinRequest(p: Params): Promise<unknown> {
+    const raw = p.joinRequest;
+    if (raw == null) throw new BridgeError(ErrorCodes.BadRequest, "tenant.inspectJoinRequest requires joinRequest");
+    let request: JoinRequest;
+    try {
+      request = typeof raw === "string" ? decodeJoinRequestUri(raw) : (raw as JoinRequest);
+    } catch (err) {
+      throw new BridgeError(ErrorCodes.BadRequest, `Not a join request: ${(err as Error).message}`);
+    }
+    const subtle = globalThis.crypto.subtle;
+    const username = request.username ?? null;
+    let directoryUser: { exists: boolean; deviceAlreadyGranted: boolean; devices: unknown[] } | null = null;
+    if (username) {
+      const directory = await this.env.tenant.openDirectory();
+      const pairs = (await directory.getUserKeyPairs?.(username)) ?? [];
+      directoryUser = {
+        exists: pairs.length > 0,
+        deviceAlreadyGranted: pairs.some((pair) => pair.signingPublicKey === request.signingPublicKey),
+        devices: await Promise.all(
+          pairs.map(async (pair) => ({
+            label: pair.label ?? null,
+            signingPublicKeyFingerprint: await fingerprintPublicKeyPem(pair.signingPublicKey, subtle),
+            wipeRequested: pair.wipeRequested,
+          })),
+        ),
+      };
+    }
+    return {
+      version: request.v,
+      username,
+      label: request.label ?? null,
+      signingPublicKey: request.signingPublicKey,
+      encryptionPublicKey: request.encryptionPublicKey,
+      signingPublicKeyFingerprint: await fingerprintPublicKeyPem(request.signingPublicKey, subtle),
+      encryptionPublicKeyFingerprint: await fingerprintPublicKeyPem(request.encryptionPublicKey, subtle),
+      hasUserKey: Boolean(request.userPublicKey),
+      requestedDocKeyIds: request.requestedDocKeyIds ?? null,
+      directoryUser,
+    };
+  }
+
   /** Push `directory` and `userdirectory`, authenticated as the tenant admin when known. */
   private async pushSystemDatabases(adminUser: PrivateUserId | undefined, adminPassword: string | undefined) {
     const networkAuthOverride = adminUser && adminPassword ? { user: adminUser, password: adminPassword } : undefined;
@@ -489,15 +617,23 @@ function headsEqual(a: string[], b: string[]): boolean {
   return b.every((h) => set.has(h));
 }
 
-function toJsonPatch(ops: UpdateOp[]): MindooJsonPatch {
-  const patch: Required<Omit<MindooJsonPatch, "baseHeads" | "textMark" | "textUnmark">> = {
+/**
+ * One `applyDocumentUpdate` from the operations: JSON ops become one JSON
+ * patch, rich-text ops one rich-text (step) patch each, all at `baseHeads`.
+ */
+function toDocumentUpdate(ops: UpdateOp[], baseHeads: string[] | undefined): MindooDocumentUpdate {
+  const patch: Required<Omit<MindooJsonPatch, "baseHeads">> = {
     set: [],
     unset: [],
     listInsert: [],
     listDelete: [],
     textSplice: [],
+    textMark: [],
+    textUnmark: [],
     counterIncrement: [],
   };
+  const richText: MindooRichTextPatch[] = [];
+  const richTextSteps: MindooRichTextStepPatch[] = [];
   for (const op of ops) {
     switch (op.op) {
       case "set":
@@ -522,9 +658,29 @@ function toJsonPatch(ops: UpdateOp[]): MindooJsonPatch {
       case "listDelete":
         patch.listDelete.push({ path: op.path, index: op.index, deleteCount: op.deleteCount });
         break;
+      case "textMark":
+        patch.textMark.push({ path: op.path, index: op.index, length: op.length, marks: op.marks });
+        break;
+      case "textUnmark":
+        patch.textUnmark.push({ path: op.path, index: op.index, length: op.length, names: op.names });
+        break;
+      case "richText": {
+        const { op: _op, ...rest } = op;
+        richText.push({ ...rest, baseHeads });
+        break;
+      }
+      case "richTextSteps":
+        richTextSteps.push({ path: op.path, steps: op.steps, baseHeads });
+        break;
       default:
         throw new BridgeError(ErrorCodes.BadRequest, `Unknown update op: ${(op as { op?: unknown }).op}`);
     }
   }
-  return patch;
+  const update: MindooDocumentUpdate = {};
+  if (Object.values(patch).some((list) => list.length > 0) || (richText.length === 0 && richTextSteps.length === 0)) {
+    update.json = { ...patch, baseHeads };
+  }
+  if (richText.length > 0) update.richText = richText;
+  if (richTextSteps.length > 0) update.richTextSteps = richTextSteps;
+  return update;
 }
