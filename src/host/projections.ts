@@ -95,18 +95,24 @@ export function toPlainJson(value: unknown, seen = new WeakSet<object>()): unkno
   if (value instanceof Uint8Array) {
     return Buffer.from(value.buffer, value.byteOffset, value.byteLength).toString("base64");
   }
+  // `seen` holds the ancestors only: a cycle becomes null, but the same object
+  // reached twice (e.g. one joined customer shared by several rows) is copied twice.
   if (seen.has(value)) {
     return null;
   }
   seen.add(value);
-  if (Array.isArray(value)) {
-    return value.map((entry) => toPlainJson(entry, seen));
+  try {
+    if (Array.isArray(value)) {
+      return value.map((entry) => toPlainJson(entry, seen));
+    }
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = toPlainJson(entry, seen);
+    }
+    return out;
+  } finally {
+    seen.delete(value);
   }
-  const out: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    out[key] = toPlainJson(entry, seen);
-  }
-  return out;
 }
 
 /** A changefeed item on the wire: `{ doc, cursor }` or `{ meta, cursor }`. */

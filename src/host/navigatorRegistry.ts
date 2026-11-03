@@ -35,7 +35,8 @@ export interface CoreNavigator {
 
 interface NavigatorEntry {
   navigator: CoreNavigator;
-  dbId: string;
+  /** The databases feeding the view (one, or several for a multi-database view). */
+  dbIds: string[];
   /** The ephemeral view behind the navigator; refreshed on demand and disposed with it. */
   view?: EphemeralView;
   /** Live-update unsubscribe (db change listener) if a subscription is active. */
@@ -47,9 +48,9 @@ export class NavigatorRegistry {
   private nextId = 1;
   private readonly navigators = new Map<string, NavigatorEntry>();
 
-  register(navigator: CoreNavigator, dbId: string, view?: EphemeralView): string {
+  register(navigator: CoreNavigator, dbIds: string[], view?: EphemeralView): string {
     const id = `nav-${this.nextId++}`;
-    this.navigators.set(id, { navigator, dbId, view });
+    this.navigators.set(id, { navigator, dbIds, view });
     return id;
   }
 

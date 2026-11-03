@@ -225,6 +225,15 @@ categoriesOnly?, documentsOnly?, fromCategory? }`. While `nav.subscribe` is
 active the view follows the database and `view-changed` fires after each
 update; without it, call `refresh`. `nav.dispose` releases the view.
 
+`db.query` / `db.liveQuery.start`: `query` is a `MindooQuery` (filter as expression
+AST or formula source text, `sortBy` with `field` or `expression`, `include` joins).
+An include names its database by id (`include.<name>.db = "crm"`); the bridge
+resolves it to the session's database, also in nested includes.
+
+`view.openNavigator` with `sources: [{ db, filter?, text?, origin? }]` instead of
+`db` builds a view across several databases (`queryViewAcross`); a subscribed
+navigator follows changes in all of them.
+
 Full-text: `fulltext.getSetup`, `fulltext.setSetup`. Full-text search is a
 `text` clause on `db.query` (adds `textScore` per row).
 
