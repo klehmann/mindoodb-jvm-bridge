@@ -92,6 +92,43 @@ try {
     assert(dm.documents.every((d) => deleted.ids.includes(d.id)), "deleteMany + listDeleted");
   });
 
+  let rt;
+  await step("rich text, marks, cursors", async () => {
+    rt = await alice.call("documents.create", { db: "notes", options: { initialValues: { type: "page" } } });
+    await alice.call("documents.update", { db: "notes", docId: rt.id, operations: [{ op: "richText", path: ["content"], spans: [
+      { type: "block", value: { type: "paragraph" } },
+      { type: "text", value: "Hello " },
+      { type: "text", value: "world", marks: { bold: true } },
+    ] }] });
+    let snap = await alice.call("documents.getRichText", { db: "notes", docId: rt.id, path: ["content"] });
+    console.log("    spans:", JSON.stringify(snap.spans));
+    assert(snap.spans.some((sp) => sp.type === "text" && sp.value === "world" && sp.marks?.bold === true), "richText patch + snapshot keeps marks");
+    const plain = await alice.call("documents.get", { db: "notes", docId: rt.id });
+    console.log("    plain content:", JSON.stringify(plain.data.content));
+    // positional step at the heads of the snapshot
+    await alice.call("documents.update", { db: "notes", docId: rt.id, baseHeads: snap.heads, operations: [
+      { op: "richTextSteps", path: ["content"], steps: [{ type: "splice", index: 7, deleteCount: 0, insert: "big ", marks: [{ index: 7, length: 3, marks: { italic: true } }] }] },
+    ] });
+    snap = await alice.call("documents.getRichText", { db: "notes", docId: rt.id, path: ["content"] });
+    console.log("    after steps:", JSON.stringify(snap.spans));
+    assert(snap.spans.some((sp) => sp.type === "text" && sp.value.includes("big") && sp.marks?.italic === true), "richTextSteps insert with mark");
+    // marks via JSON patch on plain collaborative text
+    await alice.call("documents.update", { db: "notes", docId: rt.id, operations: [{ op: "setText", path: ["title"], value: "Marked title" }] });
+    await alice.call("documents.update", { db: "notes", docId: rt.id, operations: [{ op: "textMark", path: ["title"], index: 0, length: 6, marks: { bold: true } }] });
+    let t = await alice.call("documents.getRichText", { db: "notes", docId: rt.id, path: ["title"] });
+    assert(t.spans.some((sp) => sp.value === "Marked" && sp.marks?.bold === true), "textMark");
+    await alice.call("documents.update", { db: "notes", docId: rt.id, operations: [{ op: "textUnmark", path: ["title"], index: 0, length: 6, names: ["bold"] }] });
+    t = await alice.call("documents.getRichText", { db: "notes", docId: rt.id, path: ["title"] });
+    assert(!t.spans.some((sp) => sp.marks?.bold), "textUnmark: " + JSON.stringify(t.spans));
+    // cursors survive an insert before them
+    const c = await alice.call("documents.getTextCursors", { db: "notes", docId: rt.id, path: ["title"], positions: [7, "end"] });
+    await alice.call("documents.update", { db: "notes", docId: rt.id, operations: [{ op: "textSplice", path: ["title"], index: 0, deleteCount: 0, insert: "My " }] });
+    const r = await alice.call("documents.resolveTextCursors", { db: "notes", docId: rt.id, path: ["title"], cursors: c.cursors });
+    assert(r.positions[0] === 10 && r.positions[1] === 15, "cursors move with the text: " + JSON.stringify(r.positions));
+    const old = await alice.call("documents.resolveTextCursors", { db: "notes", docId: rt.id, path: ["title"], cursors: c.cursors, heads: c.heads });
+    assert(old.positions[0] === 7, "cursor at old heads");
+  });
+
   await step("attachments", async () => {
     const big = Buffer.alloc(3 * 1024 * 1024 + 17);
     for (let i = 0; i < big.length; i++) big[i] = (i * 31) & 0xff;
@@ -219,6 +256,25 @@ try {
     await alice.call("session.refresh", {});
     const got = await alice.call("documents.get", { db: "notes", docId: doc.id });
     assert(got.data.byBob === true, "alice sees bob's change");
+  });
+  await step("concurrent rich text edits merge", async () => {
+    await bobC.call("session.refresh", { db: "notes", direction: "pull" });
+    const base = await alice.call("documents.getRichText", { db: "notes", docId: rt.id, path: ["content"] });
+    const bobBase = await bobC.call("documents.getRichText", { db: "notes", docId: rt.id, path: ["content"] });
+    assert(JSON.stringify(bobBase.spans) === JSON.stringify(base.spans), "bob sees alice's rich text");
+    // both edit offline from the same base: alice marks "Hello", bob appends text
+    await alice.call("documents.update", { db: "notes", docId: rt.id, baseHeads: base.heads, operations: [{ op: "textMark", path: ["content"], index: 1, length: 5, marks: { underline: true } }] });
+    await bobC.call("documents.update", { db: "notes", docId: rt.id, baseHeads: bobBase.heads, operations: [
+      { op: "richTextSteps", path: ["content"], steps: [{ type: "splice", index: 16, deleteCount: 0, insert: "!" }] },
+    ] });
+    await alice.call("session.refresh", { db: "notes" });
+    await bobC.call("session.refresh", { db: "notes" });
+    await alice.call("session.refresh", { db: "notes" });
+    const a = await alice.call("documents.getRichText", { db: "notes", docId: rt.id, path: ["content"] });
+    const b = await bobC.call("documents.getRichText", { db: "notes", docId: rt.id, path: ["content"] });
+    console.log("    merged:", JSON.stringify(a.spans));
+    assert(JSON.stringify(a.spans) === JSON.stringify(b.spans), "both converge");
+    assert(a.spans.some((sp) => sp.type === "text" && sp.value === "Hello" && sp.marks?.underline) && a.spans.some((sp) => sp.type === "text" && sp.value.includes("!")), "mark and insert both kept");
   });
   await step("attachment sync", async () => {
     const bytes = Buffer.from("attachment from bob ".repeat(5000));

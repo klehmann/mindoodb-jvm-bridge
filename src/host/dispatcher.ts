@@ -4,6 +4,11 @@ import {
   type EncryptedPrivateKey,
   type MindooDocumentUpdate,
   type MindooJsonPatch,
+  type MindooRichTextMaterializeValue,
+  type MindooRichTextPatch,
+  type MindooRichTextStep,
+  type MindooRichTextStepPatch,
+  type MindooTextCursorPosition,
   type PrivateUserId,
 } from "mindoodb";
 import { BridgeError, ErrorCodes, Methods } from "../protocol";
@@ -30,7 +35,11 @@ type UpdateOp =
   | { op: "textSplice"; path: Path; index: number; deleteCount: number; insert?: string }
   | { op: "increment"; path: Path; delta: number }
   | { op: "listInsert"; path: Path; index: number; values: unknown[] }
-  | { op: "listDelete"; path: Path; index: number; deleteCount: number };
+  | { op: "listDelete"; path: Path; index: number; deleteCount: number }
+  | { op: "textMark"; path: Path; index: number; length: number; marks: Record<string, MindooRichTextMaterializeValue> }
+  | { op: "textUnmark"; path: Path; index: number; length: number; names: string[] }
+  | ({ op: "richText" } & Omit<MindooRichTextPatch, "baseHeads">)
+  | { op: "richTextSteps"; path: Path; steps: MindooRichTextStep[] };
 
 interface Params {
   [key: string]: unknown;
@@ -131,6 +140,28 @@ export class Dispatcher {
       case Methods.docUndelete:
         await this.db(p.db as string).undeleteDocument(p.docId as string, p.options as never);
         return { ok: true };
+      case Methods.docGetRichText: {
+        const db = this.db(p.db as string);
+        return toPlainJson(await db.getRichTextSnapshot(await db.getDocument(p.docId as string), p.path as Path));
+      }
+      case Methods.docGetTextCursors: {
+        const db = this.db(p.db as string);
+        return db.getTextCursors(
+          await db.getDocument(p.docId as string),
+          p.path as Path,
+          (p.positions as MindooTextCursorPosition[]) ?? [],
+          p.heads ? { heads: p.heads as string[] } : undefined,
+        );
+      }
+      case Methods.docResolveTextCursors: {
+        const db = this.db(p.db as string);
+        return db.resolveTextCursors(
+          await db.getDocument(p.docId as string),
+          p.path as Path,
+          (p.cursors as string[]) ?? [],
+          p.heads ? { heads: p.heads as string[] } : undefined,
+        );
+      }
       case Methods.docListHistory:
         return this.listHistory(p);
       case Methods.docGetAtRevision: {
@@ -290,9 +321,7 @@ export class Dispatcher {
     const headsBefore = doc.getHeads();
     const baseHeads = p.baseHeads as string[] | undefined;
     const ops = (p.operations as UpdateOp[]) ?? [];
-    const json = toJsonPatch(ops);
-    if (baseHeads && baseHeads.length > 0) json.baseHeads = baseHeads;
-    const update: MindooDocumentUpdate = { json };
+    const update = toDocumentUpdate(ops, baseHeads && baseHeads.length > 0 ? baseHeads : undefined);
     const result = await db.applyDocumentUpdate(doc, update, p.options as never);
     return {
       heads: result.heads,
@@ -489,15 +518,23 @@ function headsEqual(a: string[], b: string[]): boolean {
   return b.every((h) => set.has(h));
 }
 
-function toJsonPatch(ops: UpdateOp[]): MindooJsonPatch {
-  const patch: Required<Omit<MindooJsonPatch, "baseHeads" | "textMark" | "textUnmark">> = {
+/**
+ * One `applyDocumentUpdate` from the operations: JSON ops become one JSON
+ * patch, rich-text ops one rich-text (step) patch each, all at `baseHeads`.
+ */
+function toDocumentUpdate(ops: UpdateOp[], baseHeads: string[] | undefined): MindooDocumentUpdate {
+  const patch: Required<Omit<MindooJsonPatch, "baseHeads">> = {
     set: [],
     unset: [],
     listInsert: [],
     listDelete: [],
     textSplice: [],
+    textMark: [],
+    textUnmark: [],
     counterIncrement: [],
   };
+  const richText: MindooRichTextPatch[] = [];
+  const richTextSteps: MindooRichTextStepPatch[] = [];
   for (const op of ops) {
     switch (op.op) {
       case "set":
@@ -522,9 +559,29 @@ function toJsonPatch(ops: UpdateOp[]): MindooJsonPatch {
       case "listDelete":
         patch.listDelete.push({ path: op.path, index: op.index, deleteCount: op.deleteCount });
         break;
+      case "textMark":
+        patch.textMark.push({ path: op.path, index: op.index, length: op.length, marks: op.marks });
+        break;
+      case "textUnmark":
+        patch.textUnmark.push({ path: op.path, index: op.index, length: op.length, names: op.names });
+        break;
+      case "richText": {
+        const { op: _op, ...rest } = op;
+        richText.push({ ...rest, baseHeads });
+        break;
+      }
+      case "richTextSteps":
+        richTextSteps.push({ path: op.path, steps: op.steps, baseHeads });
+        break;
       default:
         throw new BridgeError(ErrorCodes.BadRequest, `Unknown update op: ${(op as { op?: unknown }).op}`);
     }
   }
-  return patch;
+  const update: MindooDocumentUpdate = {};
+  if (Object.values(patch).some((list) => list.length > 0) || (richText.length === 0 && richTextSteps.length === 0)) {
+    update.json = { ...patch, baseHeads };
+  }
+  if (richText.length > 0) update.richText = richText;
+  if (richTextSteps.length > 0) update.richTextSteps = richTextSteps;
+  return update;
 }

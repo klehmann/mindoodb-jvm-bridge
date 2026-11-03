@@ -162,12 +162,28 @@ of a convergent ID fixed).
 where `UpdateOp` is `{op:"set",path,value}`, `{op:"unset",path}`,
 `{op:"merge",value}`, `{op:"setText",path,value}`,
 `{op:"textSplice",path,index,deleteCount,insert?}`, `{op:"increment",path,delta}`,
-`{op:"listInsert",path,index,values}` or `{op:"listDelete",path,index,deleteCount}`.
-All operations become one JSON patch (`applyDocumentUpdate`), applied by group
-(set, unset, list, text, counter), not in list order. Values may be MindooDB
+`{op:"listInsert",path,index,values}`, `{op:"listDelete",path,index,deleteCount}`,
+`{op:"textMark",path,index,length,marks}`, `{op:"textUnmark",path,index,length,names}`,
+`{op:"richText",path,spans|spansSequence,updateSpansConfig?}` (replace a rich-text
+field's spans; MindooDB diffs them, creates the field when missing) or
+`{op:"richTextSteps",path,steps:[{type:"splice",index,deleteCount,insert?,marks?:[{index,length,marks}]}]}`.
+All operations go into one `applyDocumentUpdate`: the JSON ops as one JSON patch
+applied by group (set, unset, list, text, counter, marks), not in list order;
+each rich-text op as its own rich-text patch, all at the same `baseHeads`. Values may be MindooDB
 typed values: `{"$mindoo":"atomic","value":"open"}` (a string concurrent
 changes cannot mix), `{"$mindoo":"counter","value":0}`,
 `{"$mindoo":"timestamp","value":<ms>}`; a plain string is collaborative text.
+
+Rich text and cursors:
+- `documents.getRichText` `{ db, docId, path }` → `{ path, heads, spans }`, spans
+  `{type:"text",value,marks?}` / `{type:"block",value}`. `documents.get` returns
+  only the plain string (a block is `\uFFFC`, marks are dropped). Use `heads` as
+  `baseHeads` of the next edit.
+- `documents.getTextCursors` `{ db, docId, path, positions: (number|"start"|"end")[], heads? }`
+  → `{ path, heads, cursors }`: opaque strings that keep pointing at the same
+  character while text changes (store them as atomic strings).
+- `documents.resolveTextCursors` `{ db, docId, path, cursors, heads? }` →
+  `{ path, heads, positions }`, current or at `heads`.
 With `baseHeads` the patch is made against that version and merged into the
 current one; `conflictExpected` flags that the document had moved on. Returns
 `{ heads, conflictExpected? }`.
