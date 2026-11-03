@@ -263,6 +263,17 @@ try {
     const jr = await bootB.call("identity.createJoinRequest", { identity: u.identity });
     return { u, jr };
   });
+  await step("alice inspects the join request", async () => {
+    const info = await alice.call("tenant.inspectJoinRequest", { joinRequest: bob.jr.joinRequest });
+    console.log("    ->", JSON.stringify({ ...info, signingPublicKey: "…", encryptionPublicKey: "…" }));
+    assert(info.username === "cn=bob/o=kmp" && info.label?.startsWith("JVM bridge"), "name + device label");
+    assert(/^([0-9a-f]{2}:){7}[0-9a-f]{2}$/i.test(info.signingPublicKeyFingerprint), "fingerprint format");
+    assert(info.hasUserKey === true && info.directoryUser?.exists === false, "new person with User-Key");
+    const self = await alice.call("tenant.inspectJoinRequest", { joinRequest: bob.jr.joinRequest.replace(/x/g, "x") });
+    assert(self.signingPublicKeyFingerprint === info.signingPublicKeyFingerprint, "stable fingerprint");
+    const bad = await alice.call("tenant.inspectJoinRequest", { joinRequest: "mdb://join-request/garbage" }).catch((e) => e);
+    assert(bad.code === "BadRequest", "garbage -> BadRequest");
+  });
   const approved = await step("alice approves", () => alice.call("tenant.approveJoinRequest", {
     joinRequest: bob.jr.joinRequest, adminPassword: "admin-pw", adminIdentity: created.adminIdentity, serverUrl,
   }));
@@ -279,7 +290,16 @@ try {
   const bobC = await new Conn(sidecar.hs).connect();
   await step("bob session + pull", async () => {
     await bobC.open({ tenantId, userId: "cn=bob/o=kmp", password: "bob-pw", databases: ["notes"] });
+    const progress = [];
+    bobC.subs.set("sp", (ev, p) => { if (ev === "sync-progress") progress.push(p); });
+    await bobC.call("session.watchSync", { subscriptionId: "sp" });
     const r = await bobC.call("session.refresh", {});
+    await bobC.call("session.unwatchSync", { subscriptionId: "sp" });
+    const notesPull = progress.filter((e) => e.dbId === "notes" && e.direction === "pull" && e.store === "docs" && !e.background);
+    console.log("    progress:", progress.length, "events, notes pull phases:", [...new Set(notesPull.map((e) => e.phase))].join(","));
+    assert(notesPull.some((e) => e.phase === "complete"), "sync-progress reaches complete");
+    const inspectAfter = await alice.call("tenant.inspectJoinRequest", { joinRequest: bob.jr.joinRequest });
+    assert(inspectAfter.directoryUser?.exists && inspectAfter.directoryUser.deviceAlreadyGranted, "after approval: known device");
     console.log("    refresh ->", JSON.stringify(r));
     const got = await bobC.call("documents.get", { db: "notes", docId: doc.id });
     assert(got.data.title === "Hello (edited)", "bob sees alice's doc");

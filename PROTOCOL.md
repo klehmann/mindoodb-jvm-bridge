@@ -139,6 +139,17 @@ Close with `session.close` (or just drop the connection); the child is reaped.
   overrides the device label, `username` registers the device under an existing
   person. With a server URL the grant is pushed (`directory` + `userdirectory`)
   right away. Returns `{ format, joinResponse, pushed }`.
+- `tenant.inspectJoinRequest` `{ joinRequest }` — decode a join request without
+  approving it: `{ version, username, label, signingPublicKey, encryptionPublicKey,
+  signingPublicKeyFingerprint, encryptionPublicKeyFingerprint, hasUserKey,
+  requestedDocKeyIds, directoryUser: { exists, deviceAlreadyGranted, devices } | null }`.
+  Fingerprints use MindooDB's `fingerprintPublicKeyPem` (the format Haven shows).
+- `session.watchSync` `{ subscriptionId }` / `session.unwatchSync` — `sync-progress`
+  events for every push and pull of the session (refresh, publish, approval,
+  background): `{ dbId, direction, store, phase, message, scannedEntries,
+  transferredEntries, transferredBytes, totalSourceEntries, background }`. Each
+  push/pull ends with `phase: "complete"`. The background loop starts one interval
+  (5 s) after `session.open`, so a client can subscribe before the first pull.
 - `keybag.createDocKey` `{ keyId }`, `keybag.listKeys`, `keybag.persist` —
   create/list/re-save KeyBag doc keys (create auto-persists the identity bundle).
 
@@ -264,6 +275,7 @@ starting the subscription:
 
 - live query: `query-result` (payload = `MindooQueryResult`), `query-error`.
 - navigator watch: `view-changed`.
+- sync progress: `sync-progress` (see `session.watchSync`).
 - changefeed: `change` (`{ doc, cursor }`), `caught-up` (after the replay and
   whenever a pass finds nothing new), `change-error`.
 - session lifecycle: `session-crashed` (child exited unexpectedly; re-open).
