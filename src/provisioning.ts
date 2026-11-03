@@ -12,11 +12,13 @@ import {
   isMindooURI,
   type PrivateUserId,
 } from "mindoodb";
+import { hostname } from "node:os";
 import { NodeCryptoAdapter } from "mindoodb/node";
 import { ScopedOnDiskStoreFactory } from "./scopedStoreFactory";
 import { writeIdentityBundle, type IdentityBundle } from "./identityStore";
 import { userEnvDir, userStoreBasePath, identityFilePath } from "./paths";
 import { bytesToBase64 } from "./bytes";
+import { pullSystemDatabases } from "./syncLoop";
 
 export interface ProvisionTenantInput {
   dataRoot: string;
@@ -113,6 +115,9 @@ export async function createUser(input: CreateUserInput): Promise<CreateUserResu
   const crypto = new NodeCryptoAdapter();
   const factory = new BaseMindooTenantFactory(new ScopedOnDiskStoreFactory(input.dataRoot), crypto);
   const identity = await factory.createUserId(input.username, input.password);
+  // The person-bound User-Key goes into join requests; without it an admin
+  // cannot approve (MindooDB 0.0.8x) and "default" cannot be wrapped to the user.
+  await factory.ensureUserKeyPair(identity, input.password);
   return {
     username: identity.username,
     signingPublicKey: identity.userSigningKeyPair.publicKey,
@@ -124,6 +129,7 @@ export async function createUser(input: CreateUserInput): Promise<CreateUserResu
 export interface CreateJoinRequestInput {
   dataRoot: string;
   identity: PrivateUserId;
+  /** Device label shown to the approving admin; defaults to the host name. */
   label?: string;
   format?: "object" | "uri";
 }
@@ -135,15 +141,18 @@ export async function createJoinRequest(input: CreateJoinRequestInput): Promise<
   const crypto = new NodeCryptoAdapter();
   const factory = new BaseMindooTenantFactory(new ScopedOnDiskStoreFactory(input.dataRoot), crypto);
   const format = input.format ?? "uri";
+  // The approving admin needs a device label (from the request or its own
+  // options); name the machine so the grant is recognizable in the directory.
+  const label = input.label?.trim() || `JVM bridge (${hostname()})`;
   if (format === "uri") {
     return {
       format,
-      joinRequest: factory.createJoinRequest(input.identity, { format: "uri", label: input.label }),
+      joinRequest: factory.createJoinRequest(input.identity, { format: "uri", label }),
     };
   }
   return {
     format,
-    joinRequest: factory.createJoinRequest(input.identity, { format: "object", label: input.label }),
+    joinRequest: factory.createJoinRequest(input.identity, { format: "object", label }),
   };
 }
 
@@ -193,13 +202,17 @@ export async function joinTenantAndPersist(input: JoinTenantInput): Promise<Join
     ...(input.sharePassword ? { sharePassword: input.sharePassword } : {}),
   });
 
-  for (const dbId of databases) {
-    await result.tenant.openDB(dbId);
-  }
-
   // Pull admin public keys + optional serverUrl from the (decoded) response.
   const responseMeta = extractJoinResponseMeta(input.joinResponse);
   const serverUrl = input.serverUrl ?? responseMeta.serverUrl;
+
+  // The grant is only on the server until the directory is pulled.
+  if (serverUrl) {
+    await pullSystemDatabases(result.tenant, serverUrl);
+  }
+  for (const dbId of databases) {
+    await result.tenant.openDB(dbId);
+  }
 
   const keyBagBlob = await result.keyBag.save();
   const bundle: IdentityBundle = {

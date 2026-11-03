@@ -147,6 +147,8 @@ export const Methods = {
   docCreateMany: "documents.createMany",
   docUpdate: "documents.update",
   docDelete: "documents.delete",
+  docDeleteMany: "documents.deleteMany",
+  docListDeleted: "documents.listDeleted",
   docUndelete: "documents.undelete",
   docListHistory: "documents.listHistory",
   docGetAtRevision: "documents.getAtRevision",
