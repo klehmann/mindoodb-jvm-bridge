@@ -1,6 +1,7 @@
 import {
   USER_DIRECTORY_DB_ID,
   decodeJoinRequestUri,
+  queryViewAcross,
   fingerprintPublicKeyPem,
   readTenantSetupLabel,
   writeTenantSetupLabel,
@@ -194,10 +195,10 @@ export class Dispatcher {
       }
 
       case Methods.query:
-        return toPlainJson(await this.requireQuery(p.db as string)(p.query, p.options));
+        return toPlainJson(await this.requireQuery(p.db as string)(this.resolveIncludes(p.query), p.options));
 
       case Methods.liveQueryStart:
-        this.liveReg.startQuery(p.subscriptionId as string, p.db as string, p.query, p.options);
+        this.liveReg.startQuery(p.subscriptionId as string, p.db as string, this.resolveIncludes(p.query), p.options);
         return { ok: true };
       case Methods.liveQueryStop:
         this.liveReg.stop(p.subscriptionId as string);
@@ -220,7 +221,7 @@ export class Dispatcher {
         const entry = this.navReg.get(navigatorId);
         // Keep the view itself current, then tell the client to re-read.
         const unbind = entry.view?.bindTo?.();
-        this.liveReg.startViewWatch(subscriptionId, entry.dbId, () => this.navReg.refresh(navigatorId));
+        this.liveReg.startViewWatch(subscriptionId, entry.dbIds, () => this.navReg.refresh(navigatorId));
         this.navReg.setUnsubscribe(navigatorId, () => {
           this.liveReg.stop(subscriptionId);
           unbind?.();
@@ -414,18 +415,58 @@ export class Dispatcher {
     return { history };
   }
 
+  /**
+   * Open a navigator over an ephemeral view of one database, or with
+   * `sources` over several (`queryViewAcross`): each source contributes
+   * entries under its own origin, optionally with its own filter or text clause.
+   */
   private async openNavigator(p: Params): Promise<{ navigatorId: string; columns?: unknown }> {
-    const dbId = p.db as string;
-    const db = this.db(dbId) as unknown as {
-      queryView?: (definition: unknown, options?: unknown) => Promise<unknown>;
-    };
-    if (typeof db.queryView !== "function") {
-      throw new BridgeError(ErrorCodes.BadRequest, "Virtual views are not available on this database");
+    const sources = p.sources as ViewSourceParam[] | undefined;
+    let view: EphemeralView;
+    let dbIds: string[];
+    if (sources && sources.length > 0) {
+      dbIds = sources.map((s) => s.db);
+      view = (await queryViewAcross(
+        sources.map((s) => ({
+          db: this.db(s.db),
+          ...(s.filter !== undefined ? { filter: s.filter as never } : {}),
+          ...(s.text !== undefined ? { text: s.text as never } : {}),
+          ...(s.origin !== undefined ? { origin: s.origin } : {}),
+        })),
+        p.definition as never,
+        p.options as never,
+      )) as unknown as EphemeralView;
+    } else {
+      const dbId = p.db as string;
+      dbIds = [dbId];
+      const db = this.db(dbId) as unknown as {
+        queryView?: (definition: unknown, options?: unknown) => Promise<unknown>;
+      };
+      if (typeof db.queryView !== "function") {
+        throw new BridgeError(ErrorCodes.BadRequest, "Virtual views are not available on this database");
+      }
+      view = (await db.queryView(p.definition, p.options)) as EphemeralView;
     }
-    const view = (await db.queryView(p.definition, p.options)) as EphemeralView;
     const nav = buildNavigator(view, p.navigatorOptions as NavigatorOptions | undefined);
-    const navigatorId = this.navReg.register(nav, dbId, view);
+    const navigatorId = this.navReg.register(nav, dbIds, view);
     return { navigatorId };
+  }
+
+  /**
+   * Query joins (`include`) name their database by id on the wire; MindooDB
+   * wants the database itself. Resolves nested includes too.
+   */
+  private resolveIncludes(query: unknown): unknown {
+    if (!query || typeof query !== "object") return query;
+    const q = query as { include?: Record<string, Record<string, unknown>> };
+    if (!q.include) return query;
+    const include: Record<string, unknown> = {};
+    for (const [name, spec] of Object.entries(q.include)) {
+      const resolved: Record<string, unknown> = { ...(this.resolveIncludes(spec) as Record<string, unknown>) };
+      if (typeof spec.db === "string") resolved.db = this.db(spec.db);
+      include[name] = resolved;
+    }
+    return { ...q, include };
   }
 
   private async createDocKey(p: Params): Promise<{ keyId: string; keys: string[] }> {
@@ -608,6 +649,14 @@ export class Dispatcher {
     this.syncLoop.start();
     return { ok: true, serverUrl, pushed };
   }
+}
+
+/** One source of a multi-database view (`view.openNavigator` with `sources`). */
+interface ViewSourceParam {
+  db: string;
+  filter?: unknown;
+  text?: unknown;
+  origin?: string;
 }
 
 interface NavigatorOptions {

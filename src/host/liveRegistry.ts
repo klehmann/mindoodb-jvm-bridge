@@ -80,8 +80,7 @@ export class LiveRegistry {
   }
 
   /** View-change subscription: fire a lightweight event whenever the db changes. */
-  startViewWatch(subscriptionId: string, dbId: string, refresh?: () => Promise<void>): void {
-    const db = this.getDb(dbId);
+  startViewWatch(subscriptionId: string, dbIds: string[], refresh?: () => Promise<void>): void {
     let disposed = false;
     // Coalesce bursts: one refresh in flight, at most one queued behind it.
     let running: Promise<void> | null = null;
@@ -107,11 +106,11 @@ export class LiveRegistry {
         running = null;
       });
     };
-    const unsub = db.addChangeListener?.(onChange);
+    const unsubs = dbIds.map((dbId) => this.getDb(dbId).addChangeListener?.(onChange));
     this.subs.set(subscriptionId, {
       cancel: () => {
         disposed = true;
-        unsub?.();
+        for (const unsub of unsubs) unsub?.();
       },
     });
   }
