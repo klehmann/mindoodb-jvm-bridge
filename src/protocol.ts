@@ -136,6 +136,8 @@ export const Methods = {
 
   tenantApproveJoinRequest: "tenant.approveJoinRequest",
   tenantInspectJoinRequest: "tenant.inspectJoinRequest",
+  tenantGetLabel: "tenant.getLabel",
+  tenantSetLabel: "tenant.setLabel",
   sessionWatchSync: "session.watchSync",
   sessionUnwatchSync: "session.unwatchSync",
 

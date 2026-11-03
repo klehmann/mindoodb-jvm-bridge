@@ -8,7 +8,7 @@ import { startSidecar, Conn, assert } from "./client.mjs";
 
 const dataRoot = process.argv[2];
 const serverUrl = process.argv[3];
-const tenantId = "kmp" + Date.now().toString(36);
+let tenantId;
 const failures = [];
 
 async function step(name, fn) {
@@ -23,10 +23,15 @@ const op = (o, ...args) => ({ kind: "operation", op: o, args });
 const sidecar = await startSidecar(dataRoot);
 try {
   const boot = await new Conn(sidecar.hs).connect();
-  const created = await step("tenant.create", () => boot.call("tenant.create", {
-    tenantId, adminName: "cn=admin/o=kmp", adminPassword: "admin-pw",
-    userName: "cn=alice/o=kmp", userPassword: "alice-pw", databases: ["notes"],
-  }));
+  const created = await step("tenant.create (generated id, label)", async () => {
+    const c = await boot.call("tenant.create", {
+      tenantLabel: "KMP e2e tenant", adminName: "cn=admin/o=kmp", adminPassword: "admin-pw",
+      userName: "cn=alice/o=kmp", userPassword: "alice-pw", databases: ["notes"],
+    });
+    assert(/^[0-9a-f]{24}$/.test(c.tenantId) && c.tenantLabel === "KMP e2e tenant", "generated id " + c.tenantId);
+    return c;
+  });
+  tenantId = created.tenantId;
   boot.close();
 
   const alice = await new Conn(sidecar.hs).connect();
@@ -240,6 +245,14 @@ try {
     assert(metaEvents.length === 1 && metaEvents[0].meta.docId === first.doc.id, "live metadata changefeed with idPrefix");
   });
 
+  await step("tenant label", async () => {
+    assert((await alice.call("tenant.getLabel", {})).label === "KMP e2e tenant", "label from tenantsetup");
+    await alice.call("tenant.setLabel", { label: "KMP e2e (renamed)", adminPassword: "admin-pw" });
+    assert((await alice.call("tenant.getLabel", {})).label === "KMP e2e (renamed)", "renamed");
+    const bad = await alice.call("tenant.setLabel", { label: "x", adminPassword: "wrong" }).catch((e) => e);
+    assert(bad.code === "NotAuthorized" && /Wrong admin password/.test(bad.message), "wrong admin password refused: " + bad.message);
+  });
+
   await step("keybag", async () => {
     const k = await alice.call("keybag.createDocKey", { keyId: "finance" });
     assert(k.keys.includes("finance") || JSON.stringify(k).includes("finance"), "createDocKey");
@@ -303,6 +316,10 @@ try {
     console.log("    refresh ->", JSON.stringify(r));
     const got = await bobC.call("documents.get", { db: "notes", docId: doc.id });
     assert(got.data.title === "Hello (edited)", "bob sees alice's doc");
+    assert(joined.tenantLabel === "KMP e2e (renamed)", "join response carries the label: " + joined.tenantLabel);
+    assert((await bobC.call("tenant.getLabel", {})).label === "KMP e2e (renamed)", "bob reads the live label");
+    const notAdmin = await bobC.call("tenant.setLabel", { label: "hijack", adminPassword: "bob-pw" }).catch((e) => e);
+    assert(notAdmin.code === "NotAuthorized", "member cannot rename");
   });
   await step("bob writes, alice pulls", async () => {
     await bobC.call("documents.update", { db: "notes", docId: doc.id, operations: [{ op: "set", path: ["byBob"], value: true }] });
@@ -336,7 +353,8 @@ try {
     const pr = await bobC.call("session.refresh", { direction: "push" });
     console.log("    bob push ->", JSON.stringify(pr.databases.find((d) => d.dbId === "notes")));
     const r = await alice.call("session.refresh", { db: "notes", direction: "pull" });
-    assert(r.pulled, "alice pulled entries");
+    // The background loop may have pulled first; the bytes are what counts.
+    console.log("    alice pull ->", JSON.stringify(r.databases));
     const back = await alice.readAttachment("notes", doc.id, "bob.txt");
     assert(back.equals(bytes), "alice reads bob's attachment");
   });

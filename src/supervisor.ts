@@ -128,16 +128,18 @@ export async function startSupervisor(options: SupervisorOptions = {}): Promise<
           userPassword?: string;
           databases?: string[];
           serverUrl?: string;
+          tenantLabel?: string;
         };
-        if (!p.tenantId || !p.adminName || !p.adminPassword || !p.userName || !p.userPassword) {
+        if (!p.adminName || !p.adminPassword || !p.userName || !p.userPassword) {
           throw new BridgeError(
             ErrorCodes.BadRequest,
-            "tenant.create requires tenantId, adminName, adminPassword, userName, userPassword",
+            "tenant.create requires adminName, adminPassword, userName, userPassword",
           );
         }
         return provisionTenant({
           dataRoot,
           tenantId: p.tenantId,
+          tenantLabel: p.tenantLabel,
           adminName: p.adminName,
           adminPassword: p.adminPassword,
           userName: p.userName,

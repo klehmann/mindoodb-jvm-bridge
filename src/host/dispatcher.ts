@@ -2,6 +2,8 @@ import {
   USER_DIRECTORY_DB_ID,
   decodeJoinRequestUri,
   fingerprintPublicKeyPem,
+  readTenantSetupLabel,
+  writeTenantSetupLabel,
   type JoinRequest,
   VirtualViewFactory,
   type EncryptedPrivateKey,
@@ -112,6 +114,12 @@ export class Dispatcher {
         return this.approveJoinRequest(p);
       case Methods.tenantInspectJoinRequest:
         return this.inspectJoinRequest(p);
+      case Methods.tenantGetLabel: {
+        const directory = await this.env.openTenantDb("directory");
+        return { tenantId: this.env.tenantId, label: (await readTenantSetupLabel(directory, this.env.tenant)) ?? null };
+      }
+      case Methods.tenantSetLabel:
+        return this.setTenantLabel(p);
       case Methods.sessionWatchSync:
         this.syncLoop.watchProgress(p.subscriptionId as string, (payload) =>
           this.emitter.sendEvent(p.subscriptionId as string, "sync-progress", payload),
@@ -464,7 +472,7 @@ export class Dispatcher {
     }
 
     const format = (p.format as "object" | "uri" | undefined) ?? "uri";
-    const joinResponse = await this.env.tenant.approveJoinRequest(joinRequest as never, {
+    const joinResponse = await withAdminPassword(() => this.env.tenant.approveJoinRequest(joinRequest as never, {
       adminSigningKey,
       adminPassword,
       serverUrl: (p.serverUrl as string | undefined) ?? this.env.serverUrl,
@@ -474,7 +482,7 @@ export class Dispatcher {
       username: p.username as string | undefined,
       tenantLabel: p.tenantLabel as string | undefined,
       format,
-    } as never);
+    } as never));
 
     // The grant lives in the admin-signed directory: the new member can only
     // sync once it is on the server.
@@ -526,6 +534,27 @@ export class Dispatcher {
       requestedDocKeyIds: request.requestedDocKeyIds ?? null,
       directoryUser,
     };
+  }
+
+  /**
+   * Rename the tenant (admin only): the label lives field-encrypted in the
+   * admin-signed `tenantsetup` document, so members see it after a sync.
+   */
+  private async setTenantLabel(p: Params): Promise<{ label: string; pushed: DatabaseSyncResult[] }> {
+    const label = (p.label as string | undefined)?.trim();
+    const adminPassword = p.adminPassword as string | undefined;
+    if (!label) throw new BridgeError(ErrorCodes.BadRequest, "tenant.setLabel requires a non-empty label");
+    if (!adminPassword) throw new BridgeError(ErrorCodes.BadRequest, "tenant.setLabel requires adminPassword");
+    const adminUser = (p.adminIdentity as PrivateUserId | undefined) ?? this.env.bundle.adminUser;
+    if (!adminUser) {
+      throw new BridgeError(ErrorCodes.NotAuthorized, "tenant.setLabel needs the tenant admin (adminIdentity, or a session that created the tenant)");
+    }
+    const directory = await this.env.openTenantDb("directory");
+    await withAdminPassword(() =>
+      writeTenantSetupLabel(directory, label, adminUser.userSigningKeyPair, adminPassword, this.env.tenant),
+    );
+    const pushed = this.env.serverUrl ? await this.pushSystemDatabases(adminUser, adminPassword) : [];
+    return { label, pushed };
   }
 
   /** Push `directory` and `userdirectory`, authenticated as the tenant admin when known. */
@@ -609,6 +638,18 @@ function buildNavigator(view: EphemeralView, options?: NavigatorOptions): CoreNa
   if (options?.expandAll) nav.expandAll();
   else if (typeof options?.expandLevel === "number") nav.expandToLevel(options.expandLevel);
   return nav;
+}
+
+/** WebCrypto reports a wrong password as an OperationError while decrypting the admin key. */
+async function withAdminPassword<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (err) {
+    if ((err as { name?: string })?.name === "OperationError") {
+      throw new BridgeError(ErrorCodes.NotAuthorized, "Wrong admin password");
+    }
+    throw err;
+  }
 }
 
 function headsEqual(a: string[], b: string[]): boolean {
