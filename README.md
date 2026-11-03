@@ -9,9 +9,11 @@ TypeScript engine in Node and lets the JVM drive it through a thin, authenticate
 bridge. The matching Kotlin client is
 [`mindoodb-kmp-client`](../mindoodb-kmp-client).
 
-```
-JVM / Kotlin client ──► loopback WebSocket ──► Node supervisor ──fork──► session child
-                                                              (mindoodb + decrypted KeyBag)
+```mermaid
+flowchart LR
+    C["JVM backend<br/>Kotlin client"] -- "loopback WebSocket" --> S["Node supervisor"]
+    S -- "fork per session" --> K["Session child<br/>mindoodb + decrypted KeyBag"]
+    K --- R[("On-disk replica")]
 ```
 
 ## Why a sidecar
