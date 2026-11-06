@@ -24,7 +24,7 @@ import type { Emitter } from "./emitter";
 import { NavigatorRegistry, type CoreNavigator } from "./navigatorRegistry";
 import { StreamRegistry } from "./streamRegistry";
 import { LiveRegistry } from "./liveRegistry";
-import { projectDocument, toChangeDto, toPlainJson } from "./projections";
+import { projectDocument, projectFieldTypes, toChangeDto, toPlainJson } from "./projections";
 
 type Path = Array<string | number>;
 
@@ -129,6 +129,12 @@ export class Dispatcher {
       case Methods.sessionUnwatchSync:
         this.syncLoop.unwatchProgress(p.subscriptionId as string);
         return { ok: true };
+      case Methods.sessionGetBackgroundSync:
+        return { enabled: this.syncLoop.backgroundSync };
+      case Methods.sessionSetBackgroundSync:
+        if (typeof p.enabled !== "boolean") throw new BridgeError(ErrorCodes.BadRequest, "enabled must be a boolean");
+        this.syncLoop.setBackgroundEnabled(p.enabled);
+        return { enabled: this.syncLoop.backgroundSync };
       case Methods.keybagCreateDocKey:
         return this.createDocKey(p);
       case Methods.keybagListKeys:
@@ -137,8 +143,11 @@ export class Dispatcher {
         await this.env.persistIdentity();
         return { ok: true };
 
-      case Methods.docGet:
-        return projectDocument(await this.db(p.db as string).getDocument(p.docId as string));
+      case Methods.docGet: {
+        const doc = await this.db(p.db as string).getDocument(p.docId as string);
+        const options = p.options as { fieldTypes?: boolean } | undefined;
+        return options?.fieldTypes ? { ...projectDocument(doc), fieldTypes: projectFieldTypes(doc) } : projectDocument(doc);
+      }
       case Methods.docList:
         return { ids: await this.db(p.db as string).getAllDocumentIds(p.options as never) };
       case Methods.docHeadCursor:

@@ -140,6 +140,8 @@ export const Methods = {
   tenantSetLabel: "tenant.setLabel",
   sessionWatchSync: "session.watchSync",
   sessionUnwatchSync: "session.unwatchSync",
+  sessionGetBackgroundSync: "session.getBackgroundSync",
+  sessionSetBackgroundSync: "session.setBackgroundSync",
 
   keybagCreateDocKey: "keybag.createDocKey",
   keybagListKeys: "keybag.listKeys",

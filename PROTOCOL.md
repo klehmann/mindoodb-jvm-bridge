@@ -159,6 +159,10 @@ Close with `session.close` (or just drop the connection); the child is reaped.
   transferredEntries, transferredBytes, totalSourceEntries, background }`. Each
   push/pull ends with `phase: "complete"`. The background loop starts one interval
   (5 s) after `session.open`, so a client can subscribe before the first pull.
+- `session.setBackgroundSync` `{ enabled }` / `session.getBackgroundSync` — turn the
+  background loop of this session off and on (on after `session.open`, not
+  persisted); returns `{ enabled }`. Off, `session.refresh`, publish and approval
+  still sync; turning it on syncs right away.
 - `keybag.createDocKey` `{ keyId }`, `keybag.listKeys`, `keybag.persist` —
   create/list/re-save KeyBag doc keys (create auto-persists the identity bundle).
 
@@ -172,6 +176,12 @@ Documents: `documents.get`, `documents.list`, `documents.getHeadCursor`,
 `documents.delete`, `documents.deleteMany` (`{ db, docIds }`),
 `documents.listDeleted`, `documents.undelete`, `documents.listHistory`,
 `documents.getAtRevision`.
+
+`documents.get` `{ db, docId, options?: { fieldTypes: true } }` — with `fieldTypes`
+the result also has `fieldTypes: { "<JSON Pointer>": type }` for every value whose
+plain JSON hides its type (`atomic`, `richText`, `counter`, `timestamp`, `bytes`,
+from `MindooDoc.getFieldType`); strings not listed are collaborative text. A
+client needs it to turn an edited JSON copy into matching update operations.
 
 `documents.create` `options` are MindooDB `CreateOptions` (`id`, `idPrefix`,
 `assumeUniqueId`, `decryptionKeyId`, `initialValues`, ...). With a custom `id`,
