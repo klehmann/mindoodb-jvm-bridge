@@ -97,6 +97,7 @@ Environment:
 | -------- | ------- |
 | `MINDOODB_BRIDGE_DATA` | Data root (default `./.mindoodb-bridge-data`) |
 | `MINDOODB_BRIDGE_HANDSHAKE` | Handshake file path (default `<data>/handshake.json`) |
+| `MINDOODB_BRIDGE_EXIT_WITH_PARENT` | `1`: exit when stdin closes, i.e. when the launching process is gone (the Kotlin `Sidecar.start` sets it) |
 
 On listen, the supervisor writes the handshake file and prints a ready line on
 stdout so a launcher (e.g. `Sidecar.start` in the Kotlin client) can discover
