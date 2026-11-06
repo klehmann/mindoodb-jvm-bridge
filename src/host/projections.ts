@@ -34,6 +34,47 @@ export function projectDocument(doc: MindooDoc): DocumentDTO {
   };
 }
 
+/** Field types that differ from what the plain JSON suggests (strings are text, numbers plain numbers). */
+const NOTABLE_FIELD_TYPES = new Set(["atomic", "richText", "counter", "timestamp", "bytes"]);
+
+/** A JSON Pointer (RFC 6901) for a document path, e.g. `/items/0/status`. */
+export function jsonPointer(path: Array<string | number>): string {
+  return path.map((segment) => "/" + String(segment).replace(/~/g, "~0").replace(/\//g, "~1")).join("");
+}
+
+/**
+ * The type of every leaf whose plain JSON hides it, keyed by JSON Pointer:
+ * atomic strings, rich text, counters, timestamps and bytes. A client needs
+ * them to turn an edited JSON copy into matching patches (text splices for
+ * text, a whole new value for atomic strings, increments for counters).
+ * Plain text, numbers, booleans and null are left out.
+ */
+export function projectFieldTypes(doc: MindooDoc): Record<string, string> {
+  const out: Record<string, string> = {};
+  const getFieldType = (doc as unknown as { getFieldType?: (path: Array<string | number>) => string | undefined }).getFieldType;
+  if (typeof getFieldType !== "function") return out;
+  const walk = (value: unknown, path: Array<string | number>): void => {
+    if (path.length > 0) {
+      const isContainer =
+        value !== null && typeof value === "object" && !(value instanceof Date) && !(value instanceof Uint8Array);
+      if (!isContainer) {
+        const type = getFieldType.call(doc, path);
+        if (type && NOTABLE_FIELD_TYPES.has(type)) out[jsonPointer(path)] = type;
+        return;
+      }
+    }
+    if (Array.isArray(value)) value.forEach((entry, index) => walk(entry, [...path, index]));
+    else if (value !== null && typeof value === "object") {
+      for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+        if (path.length === 0 && key.startsWith("_")) continue;
+        walk(entry, [...path, key]);
+      }
+    }
+  };
+  walk(doc.getData(), []);
+  return out;
+}
+
 export interface ViewEntryDTO {
   position: string;
   level: number;

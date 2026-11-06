@@ -74,6 +74,8 @@ export async function pullSystemDatabases(tenant: MindooTenant, serverUrl: strin
 export class SyncLoop {
   private timer: NodeJS.Timeout | null = null;
   private stopped = false;
+  /** Off: no timer; refresh, publish and approval still sync on demand. */
+  private backgroundEnabled = true;
   /** Serializes background ticks and explicit refreshes so two syncs never overlap. */
   private queue: Promise<unknown> = Promise.resolve();
   private readonly remotes = new Map<string, ContentAddressedStore>();
@@ -88,7 +90,7 @@ export class SyncLoop {
       if (url) {
         // No immediate tick: publishToServer still has to push the directory,
         // and a sync before that is refused by the server (USER_REVOKED).
-        if (!this.timer && !this.stopped) this.start({ immediate: false });
+        if (!this.timer && !this.stopped && this.backgroundEnabled) this.start({ immediate: false });
       } else {
         this.pauseTimer();
       }
@@ -146,8 +148,24 @@ export class SyncLoop {
     return result;
   }
 
+  /** Whether the timer syncs in the background (see {@link setBackgroundEnabled}). */
+  get backgroundSync(): boolean {
+    return this.backgroundEnabled;
+  }
+
+  /**
+   * Turn the background sync on or off for this session. Off, local changes
+   * stay local until the next {@link refresh} (or publish/approval); turning it
+   * back on syncs right away.
+   */
+  setBackgroundEnabled(enabled: boolean): void {
+    this.backgroundEnabled = enabled;
+    if (enabled) this.start({ immediate: true });
+    else this.pauseTimer();
+  }
+
   start(options: { immediate?: boolean } = {}): void {
-    if (!this.env.serverUrl || this.timer || this.stopped) return;
+    if (!this.env.serverUrl || this.timer || this.stopped || !this.backgroundEnabled) return;
     this.timer = setInterval(() => {
       void this.tick();
     }, this.intervalMs);
